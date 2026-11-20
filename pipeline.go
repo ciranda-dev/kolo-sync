@@ -539,7 +539,7 @@ func (c *client) fill(rep *kolostore.Replica, h kololog.Head, size uint64) error
 	if !errors.Is(err, errNoStream) {
 		return err
 	}
-	// A peer that predates STREAM_REQ answers it with an error and ends the stream: ask on a new one.
+	// A peer that does not know STREAM_REQ answers it with an error and ends the stream: ask on a new one.
 	c.streamed = false
 	if err := c.reopen(); err != nil {
 		return err

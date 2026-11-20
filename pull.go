@@ -36,7 +36,7 @@ type PullOptions struct {
 	// InFlight is the most requests for entries the pull has waiting at once, 1 to MaxInFlight. A peer that streams is
 	// sent credit in requests of 2 MiB and keeps from 2 up to InFlight of them waiting, as many as twice the measured
 	// round trip times the speed asks for; 0 is MaxInFlight, and 1 asks again only when the credit is used up.
-	// For a peer that does not stream, such as v0.1.7, it is how many answers are asked for before the first is
+	// For a peer that does not stream, it is how many answers are asked for before the first is
 	// stored: 0 is DefaultInFlight, and 1 asks for each after the one before is stored. The pull holds at most 6 MiB
 	// of answers not yet stored whatever it is.
 	InFlight int

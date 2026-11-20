@@ -251,8 +251,8 @@ func serveScript(t *testing.T, conn *kolosecure.Conn, src Source, rep *kolostore
 	return tr
 }
 
-// legacyPull is Pull as it was before the read-ahead, for a replica that holds nothing: one request, one proof, one store each.
-func legacyPull(ctx context.Context, conn Conn, rep *kolostore.Replica) error {
+// serialPull is a pull for a replica that holds nothing: one request, one proof, one store each.
+func serialPull(ctx context.Context, conn Conn, rep *kolostore.Replica) error {
 	c, h, _, err := open(ctx, conn, rep.Header().LogKey, rep.ID())
 	if err != nil {
 		return err
@@ -337,7 +337,7 @@ func TestInFlightOptionRange(t *testing.T) {
 	}
 }
 
-// With one answer in flight the pull is the one before the read-ahead: the same requests in the same order, each ENTRIES
+// With one answer in flight the pull is the serial pull: the same requests in the same order, each ENTRIES
 // request sent only after the answer before it is stored, and the same replica.
 func TestInFlightOneIsTheSerialPull(t *testing.T) {
 	checkGoroutines(t)
@@ -354,18 +354,18 @@ func TestInFlightOneIsTheSerialPull(t *testing.T) {
 		}
 		return tr, r
 	}
-	old, rOld := run(t, legacyPull)
-	now, rNow := run(t, func(ctx context.Context, c Conn, r *kolostore.Replica) error {
+	serial, rSerial := run(t, serialPull)
+	ahead, rAhead := run(t, func(ctx context.Context, c Conn, r *kolostore.Replica) error {
 		_, err := PullWith(ctx, c, r, &PullOptions{InFlight: 1})
 		return err
 	})
-	sameEntries(t, rNow, l)
-	sameEntries(t, rOld, l)
-	sameRequests(t, now.reqs, old.reqs)
+	sameEntries(t, rAhead, l)
+	sameEntries(t, rSerial, l)
+	sameRequests(t, ahead.reqs, serial.reqs)
 	var proofs int
-	for i, m := range now.reqs {
-		if m.typ == tEntriesReq && now.lens[i] != m.a {
-			t.Fatalf("request %+v read with %d entries stored: asked before the answer before it was stored", m, now.lens[i])
+	for i, m := range ahead.reqs {
+		if m.typ == tEntriesReq && ahead.lens[i] != m.a {
+			t.Fatalf("request %+v read with %d entries stored: asked before the answer before it was stored", m, ahead.lens[i])
 		}
 		if m.typ == tProofReq {
 			proofs++
@@ -374,7 +374,7 @@ func TestInFlightOneIsTheSerialPull(t *testing.T) {
 	if proofs < 3 {
 		t.Fatalf("%d proofs: the log fits few answers", proofs)
 	}
-	if n := now.maxOutstanding(); n != 1 {
+	if n := ahead.maxOutstanding(); n != 1 {
 		t.Fatalf("%d requests outstanding, want 1", n)
 	}
 }
@@ -870,7 +870,7 @@ func TestInFlightKeepsTheMessageDeadlines(t *testing.T) {
 	})
 }
 
-// An old client, which asks for one answer and its proof at a time, pulls from this server; every other test pulls with the
+// A client that asks for one answer and its proof at a time pulls from this server; every other test pulls with the
 // read-ahead from the same server, or from a script that answers one request at a time like it. The wire format is the same.
 func TestInFlightInteroperates(t *testing.T) {
 	checkGoroutines(t)
@@ -879,7 +879,7 @@ func TestInFlightInteroperates(t *testing.T) {
 	a.srv.Offer(l)
 	ba, _ := connect(t, b, a, nil)
 	r := replica(t, b, ba, a.id.PublicKey(), l.ID())
-	if err := legacyPull(testCtx(t), ba, r); err != nil {
+	if err := serialPull(testCtx(t), ba, r); err != nil {
 		t.Fatal(err)
 	}
 	sameEntries(t, r, l)

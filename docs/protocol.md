@@ -45,9 +45,7 @@ peer has `Keys` access, or, in FETCH, whenever the peer has `Keys`
 access; a key in an answer to a request without `keys` is
 a protocol error. `FetchWithKeys` sends the same bytes as `Fetch` whatever
 keys the client holds; it opens the held entries after the stream ends,
-so only the time before the client's next request depends on them. Version 1 came in v0.1.1, with the owner key in
-HEAD_REQ and with FETCH_REQ and FETCH; v0.1.0 spoke version 0, and the two
-answer each other with ERROR 4. `PullWith` sends the messages `Pull`
+so only the time before the client's next request depends on them. `PullWith` sends the messages `Pull`
 sends: with `NoMarkers` it sends no STATE_REQ for markers alone and, when
 an ENTRIES answer holds a deleted entry, one PROOF_REQ for the entries
 before it; a pull that ends with `ErrMarked` or `ErrBehind` sends no
@@ -56,10 +54,10 @@ later. A puller may send a request before the answer to the one
 before it is complete, and may keep several waiting: the server reads them in
 order and sends one answer for each, in the same order, so the puller reads
 each answer as the one its oldest unanswered request asked for. A server
-that predates STREAM_REQ (v0.1.7 and before) is pulled from this way: `Pull` sends the next
+that does not know STREAM_REQ is pulled from this way: `Pull` sends the next
 ENTRIES_REQ, starting at the end of the answer being read, and the PROOF_REQ for that end, as soon as
 the count at the start of the ENTRIES answer is read, at most
-`PullOptions.InFlight` ENTRIES_REQs ahead (3 if it is 0), which needs no change of the server. That
+`PullOptions.InFlight` ENTRIES_REQs ahead (3 if it is 0). That
 is one answer for each round trip: the next request cannot go out before the
 count of the answer before it is known. STREAM_REQ, below, does not have that limit.
 An ERROR, another version, non-minimal varints or
@@ -104,7 +102,7 @@ A server accepts these requests only after HEAD, one STREAM_REQ at a time:
 - The log is looked up and authorized again before each answer, so a withdrawn log or a peer that lost
   access gets ERROR 1 in place of the next answer, which ends the stream. `keys` and `Keys` access
   decide the keys as for ENTRIES_REQ.
-- Any other request is answered as before, once the credit is used up. A value that is not valid is
+- Any other request is answered as for a stream with no STREAM_REQ, once the credit is used up. A value that is not valid is
   ERROR 4, which ends the stream, as for any other request.
 
 A puller that has sent STREAM_REQ and CREDIT_REQs reads exactly the answers they pay for. It counts
@@ -122,18 +120,17 @@ uses the stream for other requests.
 There is no negotiation message. A puller sends STREAM_REQ as its first request for entries,
 and learns from the answer:
 
-- A server of this version streams.
-- A server that predates it answers ERROR 4, as it does to any type it does not know, and ends the stream. The
+- A server that knows STREAM_REQ streams.
+- A server that does not know it answers ERROR 4, as it does to any type it does not know, and ends the stream. The
   puller then opens a new stream, sends HEAD_REQ again, and pulls as in the first section, with
   ENTRIES_REQ and PROOF_REQ, from the index it had. It costs the one round trip of the refusal and the one of
   the new HEAD_REQ, once for each pull that has entries to get. ERROR 4 to any later request is an error of the pull, not a
   fallback, since the server has shown that it streams.
-- A server of this version serves an older puller as before: it does not stream unless it is asked, and
-  everything it answers to the requests of types 1 to 4 and 10 is what it answered then.
+- A server does not stream unless it is asked, so a puller that never sends STREAM_REQ is served with
+  the requests of types 1 to 4 and 10.
 
-The version number in every message stays 1. A refusal that is only ERROR 4 cannot tell a server that does
-not know STREAM_REQ from one that has found it invalid; a puller of this version sends only valid ones, so for
-it, the same fallback is harmless.
+A refusal that is only ERROR 4 cannot tell a server that does not know STREAM_REQ from one that has found it
+invalid; a puller sends only valid ones, so for it, the same fallback is harmless.
 
 ## References
 

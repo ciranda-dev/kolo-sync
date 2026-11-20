@@ -123,7 +123,7 @@ func TestPullStatsCounts(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			checkGoroutines(t)
 			if !streamed {
-				oldPulls(t)
+				pullsOneAnswerAtATime(t)
 			}
 			a, b := newPeer(t), newPeer(t)
 			l := sizedLog(t, a, mixedSizes(40))

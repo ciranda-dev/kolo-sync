@@ -11,21 +11,20 @@ Every fixed bound in kolo-sync, with its value and reason. A message or answer l
 | `Timeout` (opening a stream, the wait for the next request, and the start of each message read or write) | 60s, a common server default for a message | Security: a silent peer holds a stream for at most this long; a message of n bytes may take another n at `MinRate`, so a full 4 MiB message is cut off only below 16 KiB/s |
 | `MinRate` | 16 KiB/s | The slowest average speed of a message; at 4 MiB the whole read or write is allowed 316 s |
 | Answer to a request for entries | about 1 MiB | An entry larger than that goes alone, up to `MaxMessageSize` |
-| `DefaultInFlight`, `MaxInFlight` (`PullOptions.InFlight`) | 3, 1 to 8 | Speed: for a peer that predates streaming, how many answers a pull has asked for and not stored, 3 if 0; for a peer that streams, how many requests of credit it keeps waiting at most, 8 if 0. Any other value is `ErrInvalidArgument` |
+| `DefaultInFlight`, `MaxInFlight` (`PullOptions.InFlight`) | 3, 1 to 8 | Speed: for a peer that does not stream, how many answers a pull has asked for and not stored, 3 if 0; for a peer that streams, how many requests of credit it keeps waiting at most, 8 if 0. Any other value is `ErrInvalidArgument` |
 | Credit of a streamed pull | 2 MiB a request; the pull keeps from 2 requests up to `InFlight` waiting; the peer holds at most 64 MiB of credit for one stream and refuses a request of more | Memory and work: credit is what the peer may send before it needs more, so it bounds the answers on their way, the work wasted when a pull stops, and what is read and dropped to free the stream. The pull's request count follows twice the bandwidth-delay product it measures, between 2 and `InFlight` requests, so the credit waiting is more than 2 MiB and at most 4 MiB at first, and at most 16 MiB with `InFlight` 8 |
-| Answers a pull holds that are not stored yet | 6 MiB of messages at most, and one message is always admitted, so a 4 MiB one is held as before | Memory: the reader waits for room before it reads a message, once its length is checked against `MaxMessageSize`, so `InFlight` times `MaxMessageSize` is never held and a hostile peer cannot make a pull hold more; about 5 answers of 1 MiB fit, 2 of 2 MiB or 1 of 4 MiB do |
+| Answers a pull holds that are not stored yet | 6 MiB of messages at most, and one message is always admitted, so a 4 MiB one is held | Memory: the reader waits for room before it reads a message, once its length is checked against `MaxMessageSize`, so `InFlight` times `MaxMessageSize` is never held and a hostile peer cannot make a pull hold more; about 5 answers of 1 MiB fit, 2 of 2 MiB or 1 of 4 MiB do |
 | Answers one commit stores | the answers that wait, until they reach 4 MiB, at least one | One sync of the store for them all instead of one each; a failed commit stores them one at a time |
 | entries one STATE answer looks at | 32768 (`MaxMessageSize` / 128, as many entries as one ENTRIES answer can hold), then it stops early | CPU: a small request costs the server at most as many entries as an ENTRIES or FETCH request; it reads only the delete markers and keys it sends, never a ciphertext |
 
-A pull of a replica therefore holds up to 6 MiB of answers, 2 MiB more than a pull without read-ahead holds for a 4 MiB
-answer, and about 5 answers of 1 MiB when they arrive faster than they are stored; `Replica.Update` copies the answers of one
-commit, as it copied the one answer before. This bound is the same for a peer that streams and one that does not, and does
+A pull of a replica therefore holds up to 6 MiB of answers, about 5 answers of 1 MiB when they arrive faster than they are
+stored; `Replica.Update` copies the answers of one commit. This bound is the same for a peer that streams and one that does not, and does
 not grow with the credit or with the round trip: the reader takes no message off the stream until the gate has room for it,
 so the credit that is waiting is data on its way or in the transport's receive windows, which kolo-transport bounds
 (its `MaxStreamReceiveWindow` and `MaxConnReceiveWindow`), and that a peer that sends faster than the pull stores waits in them,
 which makes its own writes wait. Worst case, a pull holds 6 MiB of answers, or one answer of up to 4 MiB if that is more, plus the
 decoded copy of the answer it is reading; the server holds about two copies of one answer (the entries read from the log and the frame built from them, up to 8 MiB for a 4 MiB answer) for each stream it is writing to, however much credit the peer sends. Over all
-connections that is bounded by `MaxAnswerBytes` and `MaxTotalStreams`, whatever the number of peers; a stream or an answer past them is answered busy, and `ServerStats.RefusedByLimit` counts them. With the old request form, at most
+connections that is bounded by `MaxAnswerBytes` and `MaxTotalStreams`, whatever the number of peers; a stream or an answer past them is answered busy, and `ServerStats.RefusedByLimit` counts them. When a pull asks for one answer at a time, at most
 `InFlight` requests for entries wait at the peer, whose server reads them one at a time.
 
 A request for credit (STREAM_REQ, CREDIT_REQ) of a few bytes costs the server the answers it pays for, up to 64 MiB of the log

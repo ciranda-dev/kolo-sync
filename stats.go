@@ -9,7 +9,7 @@ import (
 // PullStats says where the time of a pull went and how full it kept the link. All durations are wall time.
 type PullStats struct {
 	// Streamed is true when the peer served the entries as a stream (STREAM_REQ) and false when the pull asked for them one
-	// answer at a time, as for a peer that predates streaming.
+	// answer at a time, as for a peer that does not stream.
 	Streamed bool
 	// Elapsed is the time since the pull started, or its whole length once it has ended.
 	Elapsed time.Duration

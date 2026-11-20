@@ -239,9 +239,9 @@ func rawStream(t *testing.T, conn *kolosecure.Conn) *kolotransport.Stream {
 	return st
 }
 
-// oldPulls makes the pulls of the test ask for one answer at a time, as they do of a peer that predates STREAM_REQ, which
-// is what the scripted servers of the tests are.
-func oldPulls(t *testing.T) {
+// pullsOneAnswerAtATime makes the pulls of the test ask for one answer at a time, as they do of a peer that does not stream,
+// which is what the scripted servers of the tests are.
+func pullsOneAnswerAtATime(t *testing.T) {
 	t.Helper()
 	was := streamPulls
 	streamPulls = false
@@ -250,7 +250,7 @@ func oldPulls(t *testing.T) {
 
 func rawServe(t *testing.T, conn *kolosecure.Conn, fn func(st *kolotransport.Stream)) {
 	t.Helper()
-	oldPulls(t)
+	pullsOneAnswerAtATime(t)
 	acceptServe(t, conn, fn)
 }
 

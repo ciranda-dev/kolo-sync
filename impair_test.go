@@ -2,7 +2,6 @@ package kolosync
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -13,20 +12,16 @@ import (
 	"testing"
 	"time"
 
-	kololog "github.com/ciranda-dev/kolo-log"
 	kolosecure "github.com/ciranda-dev/kolo-secure"
 	kolostore "github.com/ciranda-dev/kolo-store"
 	"github.com/ciranda-dev/kolo-sync/internal/netsim"
-	"github.com/ciranda-dev/kolo-sync/internal/v017"
 )
 
-// pullFn is the pull pullThrough runs, and pullStore, if not nil, makes the puller's store. oldServer, if set, serves the
-// log with the code of v0.1.7. content, if not nil, appends the entries to the log instead of n of entryBytes each.
+// pullFn is the pull pullThrough runs, and pullStore, if not nil, makes the puller's store. content, if not nil, appends the entries to the log instead of n of entryBytes each.
 // cellTransport, if not nil, gives the config of both ends and what to do with each connection.
 var (
 	pullFn        = Pull
 	pullStore     func(*testing.T) *kolostore.Store
-	oldServer     bool
 	content       func(*testing.T, *kolostore.Log)
 	cellTransport func() (*kolosecure.Config, func(*kolosecure.Conn))
 )
@@ -60,19 +55,10 @@ func pullThrough(t *testing.T, n, entryBytes int, up, down netsim.Profile, limit
 			}
 		}
 	}
-	var serve func(context.Context, Conn)
-	if oldServer {
-		old := v017.NewServer(func(_, _ ed25519.PublicKey, _ kololog.LogID) v017.Access { return v017.Keys })
-		if err := old.Offer(l); err != nil {
-			t.Fatal(err)
-		}
-		serve = func(ctx context.Context, c Conn) { old.Serve(ctx, c) }
-	} else {
-		if err := b.srv.Offer(l); err != nil {
-			t.Fatal(err)
-		}
-		serve = func(ctx context.Context, c Conn) { b.srv.Serve(ctx, c) }
+	if err := b.srv.Offer(l); err != nil {
+		t.Fatal(err)
 	}
+	serve := func(ctx context.Context, c Conn) { b.srv.Serve(ctx, c) }
 	var cfg *kolosecure.Config
 	var tune func(*kolosecure.Conn)
 	if cellTransport != nil {
@@ -203,7 +189,7 @@ func appendSizes(t *testing.T, l *kolostore.Log, sizes []int) {
 // KOLO_SYNC_CELL=<MiB>,<RTT ms>,<Mbit/s>,<loss %>,<in-flight>,<limit s>, and KOLO_SYNC_STORE=pebble to pull into Pebble, or
 // pebble-tuned for Pebble with a 256 MiB memtable and no compression, as the share app opens it (sharetransport tag).
 // The link delays each direction by half of the RTT. The log is MiB entries of 1 MiB, or with KOLO_SYNC_MIX=1 about MiB of
-// tiny, 4 KiB and 3.5 MiB entries. KOLO_SYNC_IMPL=old pulls and serves with the code of v0.1.7. The transport is the default,
+// tiny, 4 KiB and 3.5 MiB entries. The transport is the default,
 // or the share app's with KOLO_SYNC_TRANSPORT=share and the sharetransport build tag.
 func TestImpairedCell(t *testing.T) {
 	v := os.Getenv("KOLO_SYNC_CELL")
@@ -230,18 +216,12 @@ func TestImpairedCell(t *testing.T) {
 	down := up
 	down.Seed = 2
 	var stats PullStats
-	oldImpl := os.Getenv("KOLO_SYNC_IMPL") == "old"
-	oldServer = oldImpl
 	pullFn = func(ctx context.Context, conn Conn, rep *kolostore.Replica) error {
-		if oldImpl {
-			_, err := v017.PullWith(ctx, conn, rep, &v017.PullOptions{InFlight: depth})
-			return err
-		}
 		res, err := PullWith(ctx, conn, rep, &PullOptions{InFlight: depth})
 		stats = res.Stats
 		return err
 	}
-	defer func() { pullFn, pullStore, oldServer, content, cellTransport = Pull, nil, false, nil, nil }()
+	defer func() { pullFn, pullStore, content, cellTransport = Pull, nil, nil, nil }()
 	entry, entries := 1<<20, mib
 	var sizes []int
 	if os.Getenv("KOLO_SYNC_MIX") != "" {
@@ -284,9 +264,7 @@ func TestImpairedCell(t *testing.T) {
 			}
 		}
 	}
-	fmt.Printf("CELL impl=%s mix=%v transport=%q rtt=%vms rate=%vMbit loss=%v%% inflight=%d: %d of %d entries (%.1f MB) in %.1fs = %.2f MB/s err=%v\n",
-		map[bool]string{true: "old", false: "new"}[oldImpl], sizes != nil, os.Getenv("KOLO_SYNC_TRANSPORT"), rtt, rate, loss, depth, got, entries, total/1e6, took.Seconds(), bytes/1e6/took.Seconds(), err)
-	if !oldImpl {
-		fmt.Printf("STATS %+v\n", stats)
-	}
+	fmt.Printf("CELL mix=%v transport=%q rtt=%vms rate=%vMbit loss=%v%% inflight=%d: %d of %d entries (%.1f MB) in %.1fs = %.2f MB/s err=%v\n",
+		sizes != nil, os.Getenv("KOLO_SYNC_TRANSPORT"), rtt, rate, loss, depth, got, entries, total/1e6, took.Seconds(), bytes/1e6/took.Seconds(), err)
+	fmt.Printf("STATS %+v\n", stats)
 }

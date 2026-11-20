@@ -160,7 +160,7 @@ the kolo-secure connection, never in an error or a log line.
 
 ## Answers in flight
 
-A pull of a peer of this version asks for the entries once and keeps the link full. Its
+A pull asks for the entries once and keeps the link full. Its
 first request for entries, STREAM_REQ, names where to start and gives credit in bytes; the peer then
 sends each answer of about 1 MiB, followed by the proof of where it ends, without waiting for
 another request, as long as the credit lasts, and the pull sends more credit (CREDIT_REQ) before
@@ -180,11 +180,11 @@ link allow. The wire format is in [protocol.md](protocol.md#streamed-entries).
   asks again only after the credit before is used up. A pull never holds more than 6 MiB of answers that are not
   stored, whichever the number is; the credit waiting is the peer's answers on the wire, in the transport's
   windows, not in the pull's memory.
-- A peer that does not stream, v0.1.7 or earlier, answers STREAM_REQ with an error and closes the stream, and
-  the pull opens another stream and asks as v0.1.7 did, one request and one proof for each answer, up to `InFlight`
+- A peer that does not stream answers STREAM_REQ with an error and closes the stream, and
+  the pull opens another stream and asks for each answer with one request and one proof, up to `InFlight`
   requests ahead (0 is `DefaultInFlight`, 3, and 1 asks for each answer after the one before is stored). It costs two
-  round trips in each pull that has entries to get. `PullStats.Streamed` says which form a pull had. A server of
-  this version serves every older pull as before.
+  round trips in each pull that has entries to get. `PullStats.Streamed` says which form a pull had. A server also serves a
+  pull that asks for one answer at a time.
 - Answers that are already waiting when one is stored go into the same
   `Update`, one commit and one sync of the store, up to 4 MiB of answers; if
   that `Update` fails, the answers are stored one at a time, so the entries
@@ -217,7 +217,7 @@ goroutine, as often as you like; the last snapshot is the result's. A meter meas
 
 | Field | Meaning |
 |---|---|
-| `Streamed` | the peer streamed the entries; false for a peer that predates STREAM_REQ |
+| `Streamed` | the peer streamed the entries; false for a peer that does not know STREAM_REQ |
 | `Elapsed` | time since the pull started, or its length once it ended |
 | `Bytes`, `Entries`, `Answers`, `AvgAnswer()` | ENTRIES answers read: message bytes, entries, messages, average size |
 | `Requests` | requests for entries sent |
@@ -233,7 +233,7 @@ or the network, not for this machine; with `Streamed` true and `FirstByteMin` ne
 is the link or the transport's window (bytes per second times the round trip near the window). `CommitBusy` near
 `Elapsed` means the machine verifies and stores as fast as it can. `MemoryBlocked` rising with `CommitBusy`
 high means the store is the slower side. `FirstByteMin` far above the round trip means the peer is slow to
-read its log. `Streamed` false means the peer predates streaming: `Bytes` per `FirstByteMin` is then the rate of one answer per
+read its log. `Streamed` false means the peer does not stream: `Bytes` per `FirstByteMin` is then the rate of one answer per
 round trip. The meter takes a mutex a few times for each answer and costs about 60 ns an answer (`BenchmarkMeter`), against the milliseconds an answer of 1 MiB takes to arrive.
 
 ## Pulling without delete markers
