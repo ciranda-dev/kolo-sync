@@ -66,6 +66,13 @@ func TestNewServerWith(t *testing.T) {
 		{"negative streams", &ServerOptions{MaxTotalStreams: -1}, false},
 		{"negative bytes", &ServerOptions{MaxAnswerBytes: -1}, false},
 		{"bytes below one largest answer", &ServerOptions{MaxAnswerBytes: 2*MaxMessageSize - 1}, false},
+		{"watched set", &ServerOptions{MaxWatched: maxWatchItems, WatchGap: 10 * time.Millisecond}, true},
+		{"watched at the largest gap", &ServerOptions{WatchGap: 10 * time.Second}, true},
+		{"negative watched", &ServerOptions{MaxWatched: -1}, false},
+		{"watched below one request", &ServerOptions{MaxWatched: maxWatchItems - 1}, false},
+		{"negative gap", &ServerOptions{WatchGap: -time.Millisecond}, false},
+		{"gap below 10 ms", &ServerOptions{WatchGap: 9 * time.Millisecond}, false},
+		{"gap above 10 s", &ServerOptions{WatchGap: 10*time.Second + 1}, false},
 	} {
 		s, err := NewServerWith(allowAll, tc.opts)
 		if tc.ok != (err == nil) || (err != nil && !errors.Is(err, ErrInvalidArgument)) || (err == nil) != (s != nil) {
@@ -73,7 +80,8 @@ func TestNewServerWith(t *testing.T) {
 		}
 	}
 	s := NewServer(allowAll)
-	if s.limits.MaxTotalStreams != DefaultMaxTotalStreams || s.limits.MaxAnswerBytes != DefaultMaxAnswerBytes {
+	if s.limits.MaxTotalStreams != DefaultMaxTotalStreams || s.limits.MaxAnswerBytes != DefaultMaxAnswerBytes ||
+		s.limits.MaxWatched != DefaultMaxWatched || s.limits.WatchGap != DefaultWatchGap {
 		t.Fatalf("defaults %+v", s.limits)
 	}
 }

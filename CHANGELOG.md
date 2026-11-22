@@ -20,6 +20,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- WATCH_REQ and WATCH (types 14 and 15): a stream that starts with WATCH_REQ is answered with the heads of the logs it
+  names, and then with the head of each that grows, at most once per `ServerOptions.WatchGap` (default 100 ms). A log that
+  is missing, not offered or not authorized is never in a WATCH. The server probes each watched log once per gap with a read
+  from memory and signs at most one head per log per growth, however often peers name it.
+- `ServerOptions.MaxWatched` (default 1024, at least 55): the most distinct logs a connection may watch, ERROR 3 past it.
+  One watch stream per connection; watch streams are counted apart from `MaxTotalStreams`, so idle watchers do not take the
+  slots that serve pulls. A server of v0.1.0 answers WATCH_REQ with ERROR 4.
 - `PullStats.Received`: the bytes of ENTRIES answers read so far, also of the answer being read, for progress that
   moves with the bytes instead of once per answer.
 

@@ -122,7 +122,7 @@ A log is named by its owner's public key and its log ID everywhere: in `Offer`, 
 
 | Symbol | What it does |
 |---|---|
-| `NewServer(authorize)`, `NewServerWith` | A server with no offered logs; `authorize` returns `NoAccess`, `Ciphertext` or `Keys` for each request; `NewServerWith` sets the server-wide limits on streams and answer memory |
+| `NewServer(authorize)`, `NewServerWith` | A server with no offered logs; `authorize` returns `NoAccess`, `Ciphertext` or `Keys` for each request; `NewServerWith` sets the server-wide limits on streams and answer memory, the logs a connection may watch and the gap between pushes |
 | `Server.Offer`, `Server.Withdraw` | Make a kolo-store or kolo-log log or replica available, or stop offering it |
 | `Conn` | The connection every call takes: `*kolosecure.Conn`, or `koloswarm.Conn` for a direct or relayed swarm link |
 | `Server.Serve(ctx, conn)` | Answer the streams a peer opens on a connection; one per connection |

@@ -21,7 +21,9 @@ replace nor withdraw another's log by reusing its ID.
 - `NewServer(authorize) *Server` returns a server with no offered logs;
   `NewServerWith(authorize, *ServerOptions)` also sets the limits it applies over all
   its connections, `MaxTotalStreams` (default 256) and `MaxAnswerBytes` (default 256 MiB): a stream or an
-  answer past either is answered busy, and the client's call returns `ErrBusy`.
+  answer past either is answered busy, and the client's call returns `ErrBusy`. `MaxWatched` (default 1024)
+  and `WatchGap` (default 100 ms) bound the watch stream, on which `Serve` tells a peer the heads of the logs
+  it names as they grow ([protocol.md](protocol.md#watching-heads)).
   See [limits.md](limits.md).
   `authorize(peer, owner, logID) Access` gets the peer's kolo-id public
   key and the requested log's owner key and log ID, on every request of a

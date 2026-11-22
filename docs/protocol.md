@@ -26,11 +26,13 @@ payload:
     11 FETCH       uvarint(n) ‖ n × (bytes(record) ‖ bytes(ciphertext) ‖ bytes(marker) ‖ bytes(key) ‖ bytes(inclusion proof))
     12 STREAM_REQ  uvarint(start) ‖ uvarint(size) ‖ bool(keys) ‖ uvarint(credit)
     13 CREDIT_REQ  uvarint(credit)
+    14 WATCH_REQ   uvarint(n) ‖ n × (owner public key (32) ‖ log ID (32) ‖ uvarint(held))
+    15 WATCH       uvarint(n) ‖ n × bytes(head)
 
 `bytes(x)` is a uvarint length and `x`. Heads, headers, records, markers
 and proofs are kolo-log's binary encodings, at most 4 KiB each; a record
 or non-empty marker is at least 128 bytes, a key 0 or 32 bytes. A server accepts
-only types 1 to 4, 10, 12 and 13, and a puller only types 5 to 9 and 11, checked
+only types 1 to 4, 10 and 12 to 14, and a puller only types 5 to 9, 11 and 15, checked
 before the fields. The stream starts with HEAD_REQ, answered by HEAD or
 ERROR. Each later request gets one answer: PROOF_REQ needs first ≤ second
 ≤ the head's size; ENTRIES_REQ and STATE_REQ need start ≤ end < the head's
@@ -131,6 +133,35 @@ and learns from the answer:
 
 A refusal that is only ERROR 4 cannot tell a server that does not know STREAM_REQ from one that has found it
 invalid; a puller sends only valid ones, so for it, the same fallback is harmless.
+
+## Watching heads
+
+A stream that starts with WATCH_REQ instead of HEAD_REQ is a watch stream: the server tells the watcher the heads of
+the logs it names as they grow, so the watcher need not ask. WATCH_REQ names 1 to 55 logs, each with the length `held`
+the watcher has of it (55 is the most that fit in a request of 4 KiB with the largest `held`), and a later WATCH_REQ on the
+stream names more, or names one again with a new `held`. A WATCH holds 0 or more heads, each 128 to 4096 bytes in kolo-log's
+encoding, which carries its log's key and ID.
+
+- Within `ServerOptions.WatchGap` of a WATCH_REQ the server sends a WATCH, empty if need be. It holds the head of each log named
+  since the last WATCH that the peer may read and whose size is at least `held`, so the watcher learns which logs the server
+  serves.
+- After that a WATCH holds the heads of the logs that grew past the size last told, at most one WATCH per `WatchGap`
+  on a stream (more than 256 heads are split over several in the same gap).
+- A log that is missing, not offered or not authorized is never in a WATCH: it is the same answer. The log is looked up and
+  authorized again before each head, so a withdrawn log or a revoked peer gets no more heads; a log authorized after it was named
+  shows when it next grows.
+- Heads come from a cache the server shares between its streams. A watched log is probed once per `WatchGap` with the record just past
+  its cached head, which is read from memory, and its head is read, which signs it if the log is ours, only after it grew:
+  the server signs at most one head per log per growth, however often peers name it.
+- A watch stream has no idle deadline after its first WATCH_REQ is read; each message once begun keeps the deadlines of any
+  other message. A connection whose peer is gone is ended by kolo-transport's idle timeout (30 s by default).
+- One watch stream per connection, which takes one of its `MaxStreams` slots; a second is ERROR 2. It leaves the count of
+  `MaxTotalStreams` when its first request is read and is counted in a watch count with the same bound, so idle watchers
+  do not take the slots that serve pulls. A request that would make the stream watch more than `MaxWatched` logs is ERROR 3 and ends the
+  stream; a malformed request is ERROR 4.
+
+A server that does not know WATCH_REQ (v0.1.0) answers ERROR 4 and ends the stream, as it does to any type it does not know. WATCH
+is never sent unasked, so a peer that never sends WATCH_REQ sees no change.
 
 ## References
 
