@@ -21,7 +21,7 @@ replace nor withdraw another's log by reusing its ID.
 - `NewServer(authorize) *Server` returns a server with no offered logs;
   `NewServerWith(authorize, *ServerOptions)` also sets the limits it applies over all
   its connections, `MaxTotalStreams` (default 256) and `MaxAnswerBytes` (default 256 MiB): a stream or an
-  answer past either is answered busy, and the client's call returns `ErrBusy`. `MaxWatched` (default 1024)
+  answer past either is answered busy, and the client's call returns `ErrBusy`. `MaxWatched` (default 8192)
   and `WatchGap` (default 100 ms) bound the watch stream, on which `Serve` tells a peer the heads of the logs
   it names as they grow ([protocol.md](protocol.md#watching-heads)).
   See [limits.md](limits.md).
@@ -291,6 +291,104 @@ func pullLive(ctx context.Context, peers []kolosync.Conn, rep *kolostore.Replica
 
 The same function is compiled with the tests (`example_test.go`).
 
+## Following logs
+
+A `Follower` keeps the replicas added to it up to date without the application calling `Pull`. It learns of new
+heads over a watch stream on each connection, pulls a log when a verified head is larger than the replica, and retries
+a failed pull with backoff. It is safe for concurrent use and keeps nothing on disk.
+
+```go
+f, err := kolosync.NewFollower(nil)         // nil: the defaults below
+err = f.Add(rep)                            // each replica to keep up to date; its header names the owner
+go f.Follow(ctx, conn)                      // each connection; it returns when ctx or conn ends
+for {
+	ev, err := f.Next(ctx)                  // Grew, PullFailed or Diverged
+	...
+}
+```
+
+[examples/follow](../examples/follow) runs this on 127.0.0.1 and restarts from a Pebble directory.
+
+- `Add(rep)` follows a replica. A log already followed is `ErrInvalidArgument`; there is no limit on the number of logs. `Remove(owner, logID)` stops following and returns once a pull of it has ended; the caller still owns
+  the replica and closes it.
+- `Follow(ctx, conn)` opens streams on `conn` and never accepts any: the caller runs `Server.Serve` on the same
+  connection for the peer's own pulls. It returns `ctx.Err()`, the connection's error when the connection ends, or
+  `ErrClosed` after `Close`. A second `Follow` of the same connection is `ErrBusy`; a nil connection, or one whose key is
+  not 32 bytes, is `ErrInvalidArgument`. Any number of connections may be followed at once.
+- The watch stream starts with WATCH_REQ, which names every followed log with the owner key, the log ID and the length
+  the replica holds, 55 to a request ([protocol.md](protocol.md#watching-heads)). A log added later is named in one more
+  request. The peer answers with the heads of the logs it serves that are at least that long, and with the head of each
+  that grows, at most once per `ServerOptions.WatchGap`. Every head is checked against the owner key and log ID of
+  the replica before it is used; one that does not verify, or names a log not asked for, ends the watch (`ErrInvalid`,
+  `ErrProtocol`) and the follower opens it again after the backoff.
+- A head larger than the replica starts a pull from that peer, `PullWith` with the key cursor kept in memory for the
+  log, or `PullCiphertext` if `FollowOptions.Ciphertext` is set. A pull resumes from the length the replica stores and
+  from its unfinished target, and brings the delete markers. A head no larger than the replica starts nothing: it is checked
+  against the replica as `Pull` does, so another root at a size the replica holds is `ErrDiverged` and a `Diverged`
+  event, and an older head that matches is ignored.
+- One log is never pulled twice at once. The peer it is pulled from is, of the connected peers not in backoff for that log,
+  the one that offered the largest head larger than the replica, and on a tie the one with fewer pulls running. A head that
+  arrives during a pull marks the log to be pulled again after it. The follower never forwards a head, so nothing loops.
+- A failed pull is retried per peer and log after `RetryMin + U[0, min(RetryMax, RetryMin·2^n) − RetryMin)`, n being the
+  failures in a row; a success resets it. `ErrBusy`, `ErrTimeout` and connection errors are retried. `ErrNotFound` is not
+  asked again on that connection until a head or a `Hint` names the log. `ErrInvalid`, `ErrProtocol` and `ErrTooLarge`
+  stop that peer for that log on that connection. `ErrDiverged` stops the log for every peer until the application removes and adds it
+  again. A peer whose pull failed is asked again after the backoff even if its head is no larger than the replica, since the
+  markers and keys that come last may be missing. Another `Pull` of the replica by the application, or a failing store, waits `RetryMin` and does not count against the peer.
+- A peer that answers WATCH_REQ with ERROR 4, as a v0.1.0 server does, is pulled once for each followed log, and if
+  `Poll` is set, asked for the head of each log (`FetchHead`) every `Poll`: one stream per log per period. `Poll` is 0
+  by default. ERROR 3 on the watch stream means the follower names more logs than the server's `MaxWatched`: the follower opens the stream once more with the current list, and a second ERROR 3 is treated the same way. Raise `ServerOptions.MaxWatched` on the peer to follow more.
+- `Hint(h)` takes a head learned elsewhere, such as from a gossip message. It is verified like a watched head; the log is then pulled
+  from a connected peer that may serve it, the peers tried one at a time until one reaches it. `ErrNotFound` is a log not
+  followed, `ErrInvalid` a head that does not verify.
+- `Status(owner, logID)` returns `Len`, the `Largest` verified head size a connected peer offered, `Peers`, how many
+  connected peers offered a verified head of it, and `LastGrown`, when a pull last made the replica longer. It reports what
+  this follower saw and proves nothing about freshness: kolo-log heads carry no time, so a peer can keep back newer heads,
+  and a follower connected only to such a peer cannot tell. Follow on the owner's connection to reach the owner.
+- `Next(ctx)` returns the next event: `Grew` (a pull made the replica longer; call `Refresh` on a kolo-kv reader here),
+  `PullFailed` (with the peer and the error) or `Diverged`. Only the newest event of each kind per log waits, so the queue holds at most three
+  events per followed log; events that are not read are replaced, never block a pull.
+- `Close` ends every `Follow` and pull and waits for them; `Add`, `Follow` and `Next` then return `ErrClosed`.
+
+**Bounds.** The number of followed logs is not limited. `FollowOptions` bounds the work: `MaxPulls` (default 32) and `MaxPullsPerConn` (15, 1 to
+`MaxStreams-1`, since the watch takes one of the peer's 16 streams), `RetryMin` (1 s, at least 100 ms), `RetryMax` (10 minutes, at least
+`RetryMin`) and `Poll`. A pull holds at most 6 MiB of answers, so the pulls hold at most `MaxPulls` × 6 MiB. [limits.md](limits.md) gives what
+each bound protects and the measurements the defaults come from.
+
+**Restart.** The follower keeps no state. After a restart, reopen the replicas from the store and add them again; each pull
+goes on from the length and the unfinished target the store kept, and the backoff starts empty:
+
+```go
+ids, _ := store.List()
+for _, id := range ids {
+	owner, isReplica, _ := store.Owner(id)
+	if !isReplica {
+		continue
+	}
+	rep, _ := store.OpenReplica(owner, id, nil)
+	f.Add(rep)
+}
+```
+
+**With kolo-swarm.** The application runs both halves on each connection it gets:
+
+```go
+if ev.Kind == koloswarm.Connected {
+	go srv.Serve(ctx, ev.Peer.Conn())
+	go fol.Follow(ctx, ev.Peer.Conn())
+}
+```
+
+A relayed link is a `Conn` like a direct one. To pull less over a relay, use a second `Follower` with a lower
+`MaxPullsPerConn` for those connections.
+
+**Who sees what.** `Follow` names every followed log to the peer, with its owner key and length, as a HEAD_REQ of each would, and
+there is no filter per peer. Follow only a connection whose peer may know that list; to keep two audiences apart, use one
+`Follower` for each, with its own replicas. Any authenticated peer may serve a followed log, since every head, entry,
+proof and marker is checked against the owner key in the replica's header before it is stored. A connection has one accept loop:
+`Serve` takes it, so an application that also runs another protocol with its own accept loop on the same connection, as
+kolo-braid's `ServeConn` has, splits the connection between them itself.
+
 ## Errors
 
 Errors work with `errors.Is`; none carries bytes a peer sent, only numbers such as sizes and indexes.
@@ -327,6 +425,7 @@ Errors work with `errors.Is`; none carries bytes a peer sent, only numbers such 
   another `Pull` of the replica is running; try again later.
 - `ErrTooLarge`, `ErrTimeout`,
   `ErrInvalidArgument`.
+- `ErrClosed`: `Follower.Add`, `Follow` and `Next` after `Close`.
 
 ## Design
 

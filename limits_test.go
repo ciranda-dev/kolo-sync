@@ -1,14 +1,27 @@
 package kolosync
 
 import (
+	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
+	"fmt"
+	"os"
+	"runtime"
+	"runtime/debug"
+	"runtime/metrics"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	kololog "github.com/ciranda-dev/kolo-log"
+	kolosecure "github.com/ciranda-dev/kolo-secure"
 	kolostore "github.com/ciranda-dev/kolo-store"
 	kolotransport "github.com/ciranda-dev/kolo-transport"
+
+	"github.com/ciranda-dev/kolo-sync/internal/netsim"
 )
 
 func allowAll(_, _ ed25519.PublicKey, _ kololog.LogID) Access { return Keys }
@@ -67,12 +80,11 @@ func TestNewServerWith(t *testing.T) {
 		{"negative bytes", &ServerOptions{MaxAnswerBytes: -1}, false},
 		{"bytes below one largest answer", &ServerOptions{MaxAnswerBytes: 2*MaxMessageSize - 1}, false},
 		{"watched set", &ServerOptions{MaxWatched: maxWatchItems, WatchGap: 10 * time.Millisecond}, true},
-		{"watched at the largest gap", &ServerOptions{WatchGap: 10 * time.Second}, true},
+		{"gap of a minute", &ServerOptions{WatchGap: time.Minute}, true},
 		{"negative watched", &ServerOptions{MaxWatched: -1}, false},
 		{"watched below one request", &ServerOptions{MaxWatched: maxWatchItems - 1}, false},
 		{"negative gap", &ServerOptions{WatchGap: -time.Millisecond}, false},
 		{"gap below 10 ms", &ServerOptions{WatchGap: 9 * time.Millisecond}, false},
-		{"gap above 10 s", &ServerOptions{WatchGap: 10*time.Second + 1}, false},
 	} {
 		s, err := NewServerWith(allowAll, tc.opts)
 		if tc.ok != (err == nil) || (err != nil && !errors.Is(err, ErrInvalidArgument)) || (err == nil) != (s != nil) {
@@ -232,5 +244,291 @@ func TestServerAnswerBytesGrowsToTheAnswer(t *testing.T) {
 	}
 	if s := a.srv.Stats(); s.AnswerBytes > limit || s.AnswerBytes < 2*3<<20 || s.RefusedByLimit != 1 {
 		t.Fatalf("stats %+v", s)
+	}
+}
+
+// The measurements behind the follower and watch defaults, run with KOLO_SYNC_MEASURE=1 -v and no -race; docs/limits.md has them.
+
+type fixture struct {
+	owners []*peer
+	addrs  []string
+	logs   [][]*kolostore.Log
+	ctx    context.Context
+}
+
+// newFixture starts owners that each offer perOwner logs of entries entries of size bytes, on a listener of their own.
+func newFixture(t *testing.T, owners, perOwner, entries, size int) *fixture {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	fx := &fixture{ctx: ctx}
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+	for range owners {
+		a := watchPeer(t, ServerOptions{WatchGap: 10 * time.Millisecond}, nil)
+		ln, err := kolosecure.Listen(ctx, "127.0.0.1:0", a.id, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wg.Go(func() {
+			defer ln.Close()
+			for {
+				c, err := ln.Accept(ctx)
+				if err != nil {
+					return
+				}
+				wg.Go(func() { a.srv.Serve(ctx, c) })
+			}
+		})
+		var logs []*kolostore.Log
+		for range perOwner {
+			logs = append(logs, ownSized(t, a, entries, size, func(l *kolostore.Log) Source { return l }))
+		}
+		fx.owners, fx.addrs, fx.logs = append(fx.owners, a), append(fx.addrs, ln.Addr().String()), append(fx.logs, logs)
+	}
+	return fx
+}
+
+// dial connects c to owner i, through a link with the one-way delay if it is not 0.
+func (fx *fixture) dial(t *testing.T, i int, c *peer, delay time.Duration) Conn {
+	t.Helper()
+	addr := fx.addrs[i]
+	if delay > 0 {
+		p := netsim.Profile{Delay: delay, Seed: 1}
+		down := p
+		down.Seed = 2
+		link, err := netsim.New(addr, p, down)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { link.Close() })
+		addr = link.Addr()
+	}
+	conn, err := kolosecure.Dial(fx.ctx, addr, c.id, pub(fx.owners[i]), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		conn.Close()
+		time.Sleep(10 * delay) // the close must pass the link before the listener's MaxConnsPerIP counts the connection as gone
+	})
+	return conn
+}
+
+func heapInUse() uint64 {
+	var m runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc
+}
+
+// syncAll syncs every log of fx to a fresh follower with opts and prints the time, the pulls at once and the heap used.
+func (fx *fixture) syncAll(t *testing.T, delay time.Duration, opts FollowOptions) {
+	t.Helper()
+	c := newPeer(t)
+	f := newFollowerT(t, &opts)
+	var tl tally
+	tl.watch(f)
+	var reps []*kolostore.Replica
+	var conns []Conn
+	for i, a := range fx.owners {
+		conns = append(conns, fx.dial(t, i, c, delay))
+		for _, l := range fx.logs[i] {
+			rep, err := c.st.OpenReplica(pub(a), l.ID(), l.Header().Encode())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Add(rep); err != nil {
+				t.Fatal(err)
+			}
+			reps = append(reps, rep)
+		}
+	}
+	defer debug.SetGCPercent(debug.SetGCPercent(10))
+	base := heapInUse()
+	var peak atomic.Uint64
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			if m.HeapAlloc > peak.Load() {
+				peak.Store(m.HeapAlloc)
+			}
+			select {
+			case <-stop:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	})
+	start := time.Now()
+	for _, conn := range conns {
+		follow(t, f, conn)
+	}
+	for i, rep := range reps {
+		want := fx.logs[0][0].Len()
+		for deadline := time.Now().Add(5 * time.Minute); rep.Len() != want; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("replica %d has %d of %d entries", i, rep.Len(), want)
+			}
+		}
+	}
+	elapsed := time.Since(start)
+	close(stop)
+	wg.Wait()
+	t.Logf("MEASURE logs=%d delay=%v MaxPulls=%d MaxPullsPerConn=%d elapsed=%v pulls=%d perconn=%d held=%dKiB heap=%dMiB",
+		len(reps), delay, f.opts.MaxPulls, f.opts.MaxPullsPerConn, elapsed.Round(time.Millisecond), tl.maxRunning, tl.maxOnConn, tl.held>>10, (max(peak.Load(), base)-base)>>20)
+}
+
+func TestMeasurePulls(t *testing.T) {
+	if os.Getenv("KOLO_SYNC_MEASURE") == "" {
+		t.Skip("set KOLO_SYNC_MEASURE=1 to measure")
+	}
+	many := newFixture(t, 8, 32, 100, 1<<10)
+	for _, delay := range []time.Duration{0, 20 * time.Millisecond} {
+		for _, n := range []int{1, 2, 4, 8, 16, 32, 64} {
+			for run := range 3 {
+				t.Run(fmt.Sprintf("MaxPulls=%d/delay=%v/run=%d", n, delay, run), func(t *testing.T) {
+					many.syncAll(t, delay, FollowOptions{MaxPulls: n})
+				})
+			}
+		}
+	}
+	one := newFixture(t, 1, 64, 100, 1<<10)
+	for _, delay := range []time.Duration{0, 20 * time.Millisecond} {
+		for _, n := range []int{1, 2, 4, 8, 15} {
+			for run := range 3 {
+				t.Run(fmt.Sprintf("MaxPullsPerConn=%d/delay=%v/run=%d", n, delay, run), func(t *testing.T) {
+					one.syncAll(t, delay, FollowOptions{MaxPulls: 64, MaxPullsPerConn: n})
+				})
+			}
+		}
+	}
+}
+
+// cpuSeconds is the processor time the program has used; the runtime updates it at the end of a collection.
+func cpuSeconds() float64 {
+	runtime.GC()
+	s := []metrics.Sample{{Name: "/cpu/classes/user:cpu-seconds"}}
+	metrics.Read(s)
+	return s[0].Value.Float64()
+}
+
+// TestMeasureWatch prints the heap, first answer, idle processor and push time of n watched logs, then the heap of followed logs.
+func TestMeasureWatch(t *testing.T) {
+	if os.Getenv("KOLO_SYNC_MEASURE") == "" {
+		t.Skip("set KOLO_SYNC_MEASURE=1 to measure")
+	}
+	for _, n := range []int{55, 256, 1024, 4096} {
+		a := newPeer(t)
+		var logs []*kolostore.Log
+		for range n {
+			l, err := a.st.Create(a.id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { l.Close() })
+			appendN(t, l, 1)
+			logs = append(logs, l)
+		}
+		for _, gap := range []time.Duration{10 * time.Millisecond, 100 * time.Millisecond, time.Second} {
+			t.Run(fmt.Sprintf("n=%d/gap=%v", n, gap), func(t *testing.T) {
+				srv, err := NewServerWith(allowAll, &ServerOptions{MaxWatched: max(n, maxWatchItems), WatchGap: gap})
+				if err != nil {
+					t.Fatal(err)
+				}
+				a.srv = srv
+				for _, l := range logs {
+					if err := srv.Offer(l); err != nil {
+						t.Fatal(err)
+					}
+				}
+				before := heapInUse()
+				c := newWatchClient(t, a)
+				start := time.Now()
+				for i := 0; i < n; i += maxWatchItems {
+					var items []watchItem
+					for _, l := range logs[i:min(i+maxWatchItems, n)] {
+						items = append(items, named(a, l.ID(), 0))
+					}
+					c.send(items...)
+				}
+				for got := 0; got < n; {
+					got += len(c.heads())
+				}
+				first := time.Since(start)
+				perLog := (int64(heapInUse()) - int64(before)) / int64(n)
+				time.Sleep(gap)
+				cpu, at := cpuSeconds(), time.Now()
+				time.Sleep(3 * time.Second)
+				idle := (cpuSeconds() - cpu) / time.Since(at).Seconds()
+				var lat []time.Duration
+				for i := range 10 {
+					time.Sleep(gap / 3)
+					sent := time.Now()
+					appendN(t, logs[i], 1)
+					for pushed := false; !pushed; {
+						for _, h := range c.heads() {
+							pushed = pushed || h.LogID == logs[i].ID()
+						}
+					}
+					lat = append(lat, time.Since(sent))
+				}
+				slices.Sort(lat)
+				t.Logf("MEASURE watched=%d WatchGap=%v heap/log=%dB first=%v idle-cpu=%.2f%% push-median=%v push-max=%v",
+					n, gap, perLog, first.Round(time.Millisecond), idle*100, lat[len(lat)/2].Round(time.Millisecond), lat[len(lat)-1].Round(time.Millisecond))
+			})
+		}
+	}
+	for _, n := range []int{1024, 16384, 65536} {
+		t.Run(fmt.Sprintf("unknown=%d", n), func(t *testing.T) {
+			a := watchPeer(t, ServerOptions{MaxWatched: n}, nil)
+			c := newWatchClient(t, a)
+			before := heapInUse()
+			for i := 0; i < n; i += maxWatchItems {
+				var items []watchItem
+				for range min(maxWatchItems, n-i) {
+					var id kololog.LogID
+					rand.Read(id[:])
+					items = append(items, named(a, id, 0))
+				}
+				c.send(items...)
+			}
+			time.Sleep(5 * testGap)
+			t.Logf("MEASURE named-but-not-offered=%d heap/name=%dB", n, (int64(heapInUse())-int64(before))/int64(n))
+		})
+	}
+	for _, n := range []int{256, 1024, 4096} {
+		t.Run(fmt.Sprintf("followed=%d", n), func(t *testing.T) {
+			a, c := watchPeer(t, ServerOptions{MaxWatched: n}, nil), newPeer(t)
+			conn, _ := connect(t, c, a, nil)
+			var reps []*kolostore.Replica
+			for range n {
+				l := ownLog(t, a, 1)
+				rep := replica(t, c, conn, pub(a), l.ID())
+				if err := Pull(testCtx(t), conn, rep); err != nil {
+					t.Fatal(err)
+				}
+				reps = append(reps, rep)
+			}
+			before := heapInUse()
+			f := newFollowerT(t, nil)
+			for _, rep := range reps {
+				if err := f.Add(rep); err != nil {
+					t.Fatal(err)
+				}
+			}
+			follow(t, f, conn)
+			waitFor(t, "every head", func() bool {
+				st, err := f.Status(reps[n-1].Header().LogKey, reps[n-1].ID())
+				return err == nil && st.Peers == 1
+			})
+			time.Sleep(200 * time.Millisecond)
+			t.Logf("MEASURE followed=%d heap/log=%dB", n, (int64(heapInUse())-int64(before))/int64(n))
+		})
 	}
 }

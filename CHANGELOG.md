@@ -24,15 +24,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   names, and then with the head of each that grows, at most once per `ServerOptions.WatchGap` (default 100 ms). A log that
   is missing, not offered or not authorized is never in a WATCH. The server probes each watched log once per gap with a read
   from memory and signs at most one head per log per growth, however often peers name it.
-- `ServerOptions.MaxWatched` (default 1024, at least 55): the most distinct logs a connection may watch, ERROR 3 past it.
-  One watch stream per connection; watch streams are counted apart from `MaxTotalStreams`, so idle watchers do not take the
-  slots that serve pulls. A server of v0.1.0 answers WATCH_REQ with ERROR 4.
+- `ServerOptions.MaxWatched` (default 8192, at least 55): the most distinct logs a connection may watch, ERROR 3 past it. A
+  connection that names a log costs the server about 650 bytes, offered or not. One watch stream per connection; watch
+  streams are counted apart from `MaxTotalStreams`, so idle watchers do not take the slots that serve pulls. A server of
+  v0.1.0 answers WATCH_REQ with ERROR 4.
 - `Follower` (`NewFollower`, `Add`, `Remove`, `Follow`, `Hint`, `Status`, `Next`, `Close`): keeps replicas up to date from every connection
-  given to `Follow`. It names the followed logs in a WATCH_REQ, pulls a log when a verified head is larger than the replica,
-  checks a head no larger than the replica locally so that a second history is `ErrDiverged`, pulls a log from one peer at a
-  time and not from a peer in backoff, and retries a failed pull per peer and log with exponential backoff and jitter
-  (`RetryMin` 1 s, `RetryMax` 10 min). A peer that answers WATCH_REQ with ERROR 4 is pulled once and asked for heads every
-  `Poll` if that is set (0 by default). It keeps no state on disk and forwards no head.
+  given to `Follow`, with no limit on the number of logs followed. It names the followed logs in a WATCH_REQ, pulls a log when
+  a verified head is larger than the replica, checks a head no larger than the replica locally so that a second history is
+  `ErrDiverged`, pulls a log from one peer at a time and not from a peer in backoff, and retries a failed pull per peer and log with
+  exponential backoff and jitter (`RetryMin` 1 s, `RetryMax` 10 min). It runs at most `MaxPulls` (32) pulls at once, and
+  `MaxPullsPerConn` (15) on one connection; both defaults come from the measurements in docs/limits.md. A peer that answers WATCH_REQ with ERROR 4 is pulled once and
+  asked for heads every `Poll` if that is set (0 by default). It keeps no state on disk and forwards no head.
+- `examples/follow`: a follower of a log that restarts from its Pebble directory, on 127.0.0.1; docs/guide.md has a
+  section on following logs and docs/limits.md the bounds with the numbers they come from.
+- `ServerOptions.WatchGap`, `FollowOptions.RetryMin` and `RetryMax` have no upper bound: only a floor (10 ms, 100 ms) that protects the processor and the peers.
 - `PullStats.Received`: the bytes of ENTRIES answers read so far, also of the answer being read, for progress that
   moves with the bytes instead of once per answer.
 

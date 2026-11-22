@@ -167,7 +167,7 @@ is never sent unasked, so a peer that never sends WATCH_REQ sees no change.
 
 - [RFC 9162, Certificate Transparency Version 2.0](https://www.rfc-editor.org/info/rfc9162) (Experimental, December 2021).
   Takes: signed tree heads (4.10), consistency proofs (2.1.4), get-sth (5.2), get-sth-consistency (5.3),
-  get-entries (5.6) and the monitor that keeps a whole log (8.2). `Fetch` follows inclusion proofs (2.1.3) and
+  get-entries (5.6) and the monitor that keeps a whole log (8.2), whose repeated fetch of the head WATCH replaces with a push. `Fetch` follows inclusion proofs (2.1.3) and
   get-proof-by-hash (5.4), whose proof is in the tree of a size the client names, and checks them as 8.1.5 says,
   against a head the client trusts.
   Not implemented: HTTPS and JSON (kolo-codec messages on a kolo-secure stream instead); get-proof-by-hash as a

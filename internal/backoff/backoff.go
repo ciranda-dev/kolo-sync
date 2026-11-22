@@ -14,6 +14,10 @@ func Delay(n int, lo, hi time.Duration, rnd func(int64) int64) time.Duration {
 	}
 	ceil := lo
 	for i := 0; i < n && ceil < hi; i++ {
+		if ceil > hi/2 {
+			ceil = hi
+			break
+		}
 		ceil *= 2
 	}
 	ceil = min(ceil, hi)
