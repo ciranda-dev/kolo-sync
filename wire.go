@@ -18,19 +18,25 @@ const (
 	MaxMessageSize = 4 << 20
 	// MaxStreams is how many streams Serve handles at once per connection; more are answered busy.
 	MaxStreams = 16
-	// Timeout bounds opening a stream, the wait for the next request, and the start of each message read or write.
-	// A message of n bytes may then take another n at MinRate, so a slow but moving 4 MiB answer is not cut off.
+	// Timeout bounds opening a stream, the wait for the next request, the start of each message read, and each
+	// MinProgress bytes of a message read after that: a slow message that keeps moving is not cut off, one that stops is.
+	// A message written may take Timeout plus its size at 500 bytes a second.
 	Timeout = 60 * time.Second
-	// MinRate is the slowest average speed, in bytes a second, at which a message may be read or written.
-	MinRate = 16 << 10
+	// MinProgress is the bytes of a message that must be read or written within every Timeout once it has begun, so
+	// the slowest a message may move is 16 KiB a minute, about 273 bytes a second.
+	MinProgress = 16 << 10
 )
+
+// writeMinRate is the slowest average, in bytes a second, at which a whole message may be written: the server holds an
+// answer until it is written. Tests raise it.
+var writeMinRate = 500
 
 // timeout is Timeout; tests shorten it in TestMain, before any goroutine runs.
 var timeout = Timeout
 
 const (
 	version   = 1
-	maxSmall  = 4 << 10 // head, header, record, marker or proof encoding
+	maxSmall  = 4 << 10 // head, header, record, marker or proof encoding, and the bound of a request
 	minSigned = 128     // a signed kolo-log record or marker holds at least a key, a log ID and a signature
 	keySize   = 32
 	overhead  = 32                         // upper bound of a message's header fields, or of one item's
@@ -386,6 +392,7 @@ func readFrame(r io.Reader, requests bool, grow func(int)) (message, error) {
 type frameHooks struct {
 	size func(n int) error           // the length n is known and checked, before the body is allocated
 	peek func(n int, b []byte) error // the first bytes of a body of n bytes, before the rest is read
+	got  func(n int)                 // readAnswer only: n more bytes of the body were read
 }
 
 // peekSize is enough bytes for the version, the type and a count.
@@ -399,6 +406,9 @@ func readFrameWith(r io.Reader, requests bool, hooks frameHooks) (message, error
 	n, err := frameSize(h)
 	if err != nil {
 		return message{}, err
+	}
+	if requests && n > maxSmall {
+		return message{}, fmt.Errorf("%w: request of %d bytes", ErrTooLarge, n)
 	}
 	if hooks.size != nil {
 		if err := hooks.size(n); err != nil {
@@ -439,54 +449,97 @@ func entriesCount(b []byte) (uint64, bool) {
 	return c, n > 0
 }
 
-// readAnswer reads one answer within timeout, like readMsg, and calls hooks on the way.
-func readAnswer(st *kolotransport.Stream, hooks frameHooks) (message, error) {
-	if err := st.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return message{}, ioErr(err)
+// paced reads from st and starts a new deadline of timeout at the first read after each MinProgress bytes, at most
+// once every eighth of the timeout, which keeps the calls to the transport few on a fast path. got, if not nil, is told
+// the bytes read in steps of at least MinProgress, and the rest at flush.
+type paced struct {
+	st     *kolotransport.Stream
+	left   int       // bytes still to come before the deadline may move
+	set    time.Time // when the deadline was set last, zero to set one at the next read
+	got    func(n int)
+	unsent int
+}
+
+// restart makes the next read start a new deadline.
+func (p *paced) restart() { p.left, p.set = 0, time.Time{} }
+
+func (p *paced) Read(b []byte) (int, error) {
+	if p.left <= 0 {
+		if now := time.Now(); p.set.IsZero() || now.Sub(p.set) >= timeout/8 {
+			if err := p.st.SetReadDeadline(now.Add(timeout)); err != nil {
+				return 0, err
+			}
+			p.left, p.set = MinProgress, now
+		}
 	}
+	n, err := p.st.Read(b)
+	p.left -= n
+	if p.got != nil {
+		if p.unsent += n; p.unsent >= MinProgress {
+			p.flush()
+		}
+	}
+	return n, err
+}
+
+func (p *paced) flush() {
+	if p.got != nil && p.unsent > 0 {
+		p.got(p.unsent)
+	}
+	p.unsent = 0
+}
+
+// readAnswer reads one answer, like readMsg, and calls hooks on the way.
+func readAnswer(st *kolotransport.Stream, hooks frameHooks) (message, error) {
+	r := &paced{st: st}
 	size := hooks.size
 	hooks.size = func(n int) error {
-		// The wait for memory in size is not the peer's time, so the body's deadline starts after it.
 		var err error
 		if size != nil {
 			err = size(n)
 		}
-		st.SetReadDeadline(time.Now().Add(timeout + allowance(n)))
+		// The wait for memory in size is not the peer's time, so the body's deadline starts after it.
+		r.restart()
+		r.got = hooks.got
 		return err
 	}
-	return readFrameWith(st, false, hooks)
+	if peek := hooks.peek; peek != nil {
+		hooks.peek = func(n int, b []byte) error {
+			err := peek(n, b)
+			r.restart() // the writes in peek are not the peer's time either
+			return err
+		}
+	}
+	m, err := readFrameWith(r, false, hooks)
+	r.flush()
+	return m, err
 }
 
-// readMsg reads one length-prefixed request, or answer if requests is false, within timeout.
+// readMsg reads one length-prefixed request, or answer if requests is false: its length within timeout, then each
+// MinProgress bytes of its body within timeout.
 func readMsg(st *kolotransport.Stream, requests bool) (message, error) {
-	if err := st.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return message{}, ioErr(err)
-	}
-	return readFrame(st, requests, func(n int) { st.SetReadDeadline(time.Now().Add(timeout + allowance(n))) })
+	r := &paced{st: st}
+	return readFrame(r, requests, func(int) { r.restart() })
 }
 
-// discardMsg reads and drops one message within timeout; it checks only the length.
+// discardMsg reads and drops one message, with the deadlines of readMsg; it checks only the length.
 func discardMsg(st *kolotransport.Stream) error {
-	if err := st.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return ioErr(err)
-	}
+	r := &paced{st: st}
 	var h [4]byte
-	if _, err := io.ReadFull(st, h[:]); err != nil {
+	if _, err := io.ReadFull(r, h[:]); err != nil {
 		return ioErr(err)
 	}
 	n, err := frameSize(h)
 	if err != nil {
 		return err
 	}
-	st.SetReadDeadline(time.Now().Add(timeout + allowance(n)))
-	_, err = io.CopyN(io.Discard, st, int64(n))
+	r.restart()
+	_, err = io.CopyN(io.Discard, r, int64(n))
 	return ioErr(err)
 }
 
-// allowance is the time a message of n bytes may take beyond timeout.
-func allowance(n int) time.Duration { return time.Duration(n) * time.Second / MinRate }
-
-// writeMsg writes one length-prefixed message within timeout.
+// writeMsg writes one length-prefixed message within timeout plus its size at writeMinRate: a reader that moves the
+// message at least that fast is served however slow its path, and one that barely reads cannot hold it for hours.
 // It returns the bytes written, also on an error.
 func writeMsg(st *kolotransport.Stream, m message) (int, error) {
 	b := frameOf(m)
@@ -494,7 +547,7 @@ func writeMsg(st *kolotransport.Stream, m message) (int, error) {
 	if len(b)-4 > MaxMessageSize {
 		return 0, fmt.Errorf("%w: message of %d bytes", ErrTooLarge, len(b)-4)
 	}
-	if err := st.SetWriteDeadline(time.Now().Add(timeout + allowance(len(b)))); err != nil {
+	if err := st.SetWriteDeadline(time.Now().Add(timeout + time.Duration(len(b))*time.Second/time.Duration(writeMinRate))); err != nil {
 		return 0, ioErr(err)
 	}
 	n, err := st.Write(b)

@@ -1352,14 +1352,14 @@ func TestOfferAndWithdrawArguments(t *testing.T) {
 	}
 }
 
-// A message that arrives slower than the timeout but faster than MinRate is read: it may take its allowance on top of
-// the timeout, so a large answer over a slow path is not cut off while it makes progress.
-func TestSlowMessageWithinAllowanceIsRead(t *testing.T) {
+// A message that takes longer than the timeout in all is read while MinProgress bytes of it arrive within each timeout,
+// so a large answer over a slow path is not cut off while it makes progress.
+func TestSlowMessageIsRead(t *testing.T) {
 	checkGoroutines(t)
 	a, b := newPeer(t), newPeer(t)
 	a.srv = nil
 	ba, ab := connect(t, b, a, nil)
-	const size = 100 << 10 // allowance 6.25 s on top of the 3 s timeout
+	const size = 100 << 10
 	rawServe(t, ab, func(st *kolotransport.Stream) {
 		readMsg(st, true)
 		b := frame(size, make([]byte, size))

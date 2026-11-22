@@ -815,10 +815,10 @@ func TestInFlightCancel(t *testing.T) {
 	}
 }
 
-// A message that is slow but within its allowance is read while the next ones are in flight, and one that stalls
+// A message that is slow but keeps moving is read while the next ones are in flight, and one that stalls
 // ends the pull with ErrTimeout, as without the read-ahead.
 func TestInFlightKeepsTheMessageDeadlines(t *testing.T) {
-	t.Run("slow within the allowance", func(t *testing.T) {
+	t.Run("slow but moving", func(t *testing.T) {
 		checkGoroutines(t)
 		a, b, c := newPeer(t), newPeer(t), newPeer(t)
 		c.srv = nil
@@ -833,7 +833,7 @@ func TestInFlightKeepsTheMessageDeadlines(t *testing.T) {
 				n := min(len(real), 25<<10)
 				st.Write(real[:n])
 				real = real[n:]
-				time.Sleep(1100 * time.Millisecond) // over the timeout in all, within the allowance
+				time.Sleep(1100 * time.Millisecond) // over the timeout in all, MinProgress within each
 			}
 			return true
 		})
@@ -852,7 +852,7 @@ func TestInFlightKeepsTheMessageDeadlines(t *testing.T) {
 		tr := serveScript(t, cb, l, r, func(st *kolotransport.Stream, _ int, req message, real []byte) bool {
 			if req.typ == tEntriesReq && req.a > 0 {
 				st.Write(real[:len(real)/2]) // then nothing
-				time.Sleep(timeout + allowance(len(real)) + time.Second)
+				time.Sleep(2 * timeout)
 				return true
 			}
 			return false

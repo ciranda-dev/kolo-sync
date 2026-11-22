@@ -450,7 +450,7 @@ func TestStreamStalledAnswer(t *testing.T) {
 	_, _, _, r, bc, tr := streamScenario(t, []int{1200 << 10, 20 << 10, 20 << 10}, func(st *kolotransport.Stream, kind byte, n int, real []byte) bool {
 		if kind == 'E' && n == 1 {
 			st.Write(real[:len(real)/2])
-			time.Sleep(timeout + allowance(len(real)) + time.Second)
+			time.Sleep(2 * timeout)
 			return true
 		}
 		return false
@@ -464,8 +464,8 @@ func TestStreamStalledAnswer(t *testing.T) {
 	}
 }
 
-// An answer that is slow but within its allowance is read, with the credit of the next ones in flight.
-func TestStreamSlowAnswerWithinTheAllowance(t *testing.T) {
+// An answer that is slow but keeps moving is read, with the credit of the next ones in flight.
+func TestStreamSlowAnswerIsRead(t *testing.T) {
 	checkGoroutines(t)
 	_, _, l, r, bc, _ := streamScenario(t, []int{60 << 10, 60 << 10}, func(st *kolotransport.Stream, kind byte, n int, real []byte) bool {
 		if kind != 'E' || n != 0 {
