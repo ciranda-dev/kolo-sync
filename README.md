@@ -122,7 +122,7 @@ A log is named by its owner's public key and its log ID everywhere: in `Offer`, 
 
 | Symbol | What it does |
 |---|---|
-| `NewServer(authorize)`, `NewServerWith` | A server with no offered logs; `authorize` returns `NoAccess`, `Ciphertext` or `Keys` for each request; `NewServerWith` sets the server-wide limits on streams and answer memory (`ServerOptions`: `MaxTotalStreams`, `MaxAnswerBytes`), `MaxWatched` and `WatchGap` |
+| `NewServer(authorize)`, `NewServerWith` | A server with no offered logs; `authorize` returns `NoAccess`, `Ciphertext` or `Keys` for each request; `NewServerWith` sets the server-wide limits on streams and answer memory (`ServerOptions`: `MaxTotalStreams`, `MaxAnswerBytes`), `MaxWatched`, `MaxWatchBytes` and `WatchGap` |
 | `Server.Offer`, `Server.Withdraw` | Make a kolo-store or kolo-log log or replica available, or stop offering it |
 | `Conn` | The connection every call takes: `*kolosecure.Conn`, or `koloswarm.Conn` for a direct or relayed swarm link |
 | `Server.Serve(ctx, conn)` | Answer the streams a peer opens on a connection; one per connection |
@@ -135,9 +135,9 @@ A log is named by its owner's public key and its log ID everywhere: in `Offer`, 
 | `Follower.Follow(ctx, conn)` | Watch the logs the peer on `conn` serves for new heads and pull each log that grew, retrying a failed pull with exponential backoff and jitter, until `ctx` or the connection ends; the caller runs `Server.Serve` on the same connection. A peer of v0.1.0 is pulled once and asked for heads every `Poll`, if set |
 | `Follower.Hint(head)` | Give a head learned elsewhere: it is verified, then the log is pulled from a connected peer |
 | `Follower.Status`, `FollowStatus` | `Len`, the `Largest` head size a connected peer offered, `Peers` and `LastGrown` of a followed log |
-| `Follower.Next`, `FollowEvent`, `FollowEventKind` | The next event: `Grew`, `PullFailed` or `Diverged` |
+| `Follower.Next`, `FollowEvent`, `FollowEventKind` | The next event: `FollowGrew`, `FollowPullFailed` or `FollowDiverged` |
 | `Follower.Close` | End every `Follow` and pull; `Add`, `Follow` and `Next` then return `ErrClosed` |
-| `ServerOptions.MaxWatched`, `ServerOptions.WatchGap`, `DefaultMaxWatched`, `DefaultWatchGap` | The logs one connection may watch (8192) and the least time between two pushes (100 ms), see [limits](docs/limits.md) |
+| `ServerOptions.MaxWatched`, `ServerOptions.MaxWatchBytes`, `ServerOptions.WatchGap`, `DefaultMaxWatched`, `DefaultMaxWatchBytes`, `DefaultWatchGap` | The logs one connection may watch (8192), the memory of all watched names (64 MiB) and the least time between two pushes (100 ms), see [limits](docs/limits.md) |
 | `FetchHeader`, `FetchHead` | The log's signed header, to open a replica, and the peer's signed head |
 | `Fetch` | A range of entries, each checked against a head you trust, without a replica |
 | `FetchWithKeys` | `Fetch` with entry keys you hold, to read from a peer that serves ciphertext only |

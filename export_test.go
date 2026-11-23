@@ -2,10 +2,12 @@ package kolosync
 
 import (
 	"context"
+	"crypto/ed25519"
 	"slices"
 	"sync"
 	"time"
 
+	kololog "github.com/ciranda-dev/kolo-log"
 	kolostore "github.com/ciranda-dev/kolo-store"
 )
 
@@ -79,4 +81,10 @@ func (f *Follower) useClock(c *fakeClock) { f.clk = clock{now: c.now, after: c.a
 
 func (f *Follower) usePull(fn func(ctx context.Context, conn Conn, rep *kolostore.Replica, keysFrom uint64) (uint64, error)) {
 	f.pull = fn
+}
+
+func (f *Follower) useVerify(fn func(ed25519.PublicKey, kololog.LogID, kololog.Head) (kololog.VerifiedHead, error)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.verify = fn
 }

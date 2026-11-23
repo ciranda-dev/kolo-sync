@@ -3,6 +3,7 @@ package kolosync
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/binary"
 	"errors"
 	koloid "github.com/ciranda-dev/kolo-id"
@@ -487,7 +488,7 @@ func TestTwoPeersSplitViewDetected(t *testing.T) {
 	follow(t, f, ca)
 	waitPeers(2)
 	close(release)
-	ev := waitEvent(t, f, Diverged)
+	ev := waitEvent(t, f, FollowDiverged)
 	if !errors.Is(ev.Err, ErrDiverged) || !bytes.Equal(ev.Peer, pub(pa)) || ev.Len != 6 {
 		t.Fatalf("event %+v", ev)
 	}
@@ -587,5 +588,60 @@ func waitLong(t *testing.T, what string, ok func() bool) {
 		if time.Now().After(end) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
+	}
+}
+
+// A WATCH of more heads than a server sends in one is a protocol error, so a peer cannot make the follower verify thousands.
+func TestFollowWatchOverBatchEnds(t *testing.T) {
+	checkGoroutines(t)
+	var s *scripted
+	ready, ended := make(chan struct{}), make(chan struct{})
+	s = newScripted(t, 5, nil, watchScript(t, func() [][]byte {
+		<-ready
+		h := signedHead(t, s.l).Encode()
+		heads := make([][]byte, watchBatch+1)
+		for i := range heads {
+			heads[i] = h
+		}
+		return heads
+	}, ended))
+	close(ready)
+	select {
+	case <-ended:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the follower kept the watch stream")
+	}
+	if n := s.pulls.Load(); n != 0 {
+		t.Fatalf("%d pulls from a WATCH over the batch", n)
+	}
+}
+
+// A head the peer already offered is not verified again.
+func TestFollowVerifiesAHeadOncePerPeer(t *testing.T) {
+	checkGoroutines(t)
+	var s *scripted
+	ready, ended := make(chan struct{}), make(chan struct{})
+	s = newScripted(t, 5, nil, watchScript(t, func() [][]byte {
+		<-ready
+		h := signedHead(t, s.l).Encode()
+		heads := make([][]byte, watchBatch-1)
+		for i := range heads {
+			heads[i] = h
+		}
+		return append(heads, bytes.Repeat([]byte{7}, 200)) // ends the watch once the heads before it are read
+	}, ended))
+	var verified atomic.Int32
+	s.f.useVerify(func(pub ed25519.PublicKey, id kololog.LogID, h kololog.Head) (kololog.VerifiedHead, error) {
+		verified.Add(1)
+		return kololog.VerifyHead(pub, id, h)
+	})
+	close(ready)
+	select {
+	case <-ended:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the follower kept the watch stream")
+	}
+	if n := verified.Load(); n != 1 {
+		t.Fatalf("%d signature checks for %d equal heads, want 1", n, watchBatch-1)
 	}
 }

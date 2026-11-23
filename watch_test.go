@@ -567,3 +567,42 @@ func main() {
 	kolosync.NewServer(func(_, _ ed25519.PublicKey, _ kololog.LogID) kolosync.Access { return kolosync.Keys }).Serve(ctx, c)
 }
 `
+
+// The names watched over all connections stop at MaxWatchBytes, the stream that asked for more is answered too large,
+// a pull on the same connection still works, and the bytes of a connection that ends are given back.
+func TestWatchNodeBudget(t *testing.T) {
+	checkGoroutines(t)
+	a := watchPeer(t, ServerOptions{MaxWatchBytes: maxWatchItems * watchNameBytes}, nil)
+	l := ownLog(t, a, 3)
+	names := func(n int) []watchItem {
+		items := make([]watchItem, n)
+		for i := range items {
+			items[i] = named(a, kololog.LogID{byte(i), 1}, 0)
+		}
+		return items
+	}
+	first, _ := connect(t, newPeer(t), a, nil)
+	c1 := &watchClient{t: t, st: rawStream(t, first)}
+	c1.send(names(30)...)
+	c1.heads()
+
+	cp := newPeer(t)
+	conn, _ := connect(t, cp, a, nil)
+	c2 := &watchClient{t: t, st: rawStream(t, conn)}
+	c2.send(names(maxWatchItems)...)
+	c2.ended(codeTooLarge)
+	waitFor(t, "the refused names to be given back", func() bool { return a.srv.Stats().WatchBytes == 30*watchNameBytes })
+	if n := a.srv.Stats().RefusedByLimit; n != 1 {
+		t.Fatalf("RefusedByLimit %d, want 1", n)
+	}
+	rep := replica(t, cp, conn, pub(a), l.ID())
+	if err := Pull(testCtx(t), conn, rep); err != nil || rep.Len() != 3 {
+		t.Fatalf("pull after the refusal: len %d, %v", rep.Len(), err)
+	}
+
+	first.Close()
+	waitFor(t, "the bytes of the ended connection", func() bool { return a.srv.Stats().WatchBytes == 0 })
+	c3 := newWatchClient(t, a)
+	c3.send(names(maxWatchItems)...)
+	c3.heads()
+}

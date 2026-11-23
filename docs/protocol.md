@@ -139,7 +139,7 @@ invalid; a puller sends only valid ones, so for it, the same fallback is harmles
 A stream that starts with WATCH_REQ instead of HEAD_REQ is a watch stream: the server tells the watcher the heads of
 the logs it names as they grow, so the watcher need not ask. WATCH_REQ names 1 to 55 logs, each with the length `held`
 the watcher has of it (55 is the most that fit in a request of 4 KiB with the largest `held`), and a later WATCH_REQ on the
-stream names more, or names one again with a new `held`. A WATCH holds 0 or more heads, each 128 to 4096 bytes in kolo-log's
+stream names more, or names one again with a new `held`. A WATCH holds 0 to 256 heads (more is a protocol error), each 128 to 4096 bytes in kolo-log's
 encoding, which carries its log's key and ID.
 
 - Within `ServerOptions.WatchGap` of a WATCH_REQ the server sends a WATCH, empty if need be. It holds the head of each log named
@@ -147,6 +147,7 @@ encoding, which carries its log's key and ID.
   serves.
 - After that a WATCH holds the heads of the logs that grew past the size last told, at most one WATCH per `WatchGap`
   on a stream (more than 256 heads are split over several in the same gap).
+  A watcher checks the signature of each head once per peer: a head equal to one that peer already offered is not checked again.
 - A log that is missing, not offered or not authorized is never in a WATCH: it is the same answer. The log is looked up and
   authorized again before each head, so a withdrawn log or a revoked peer gets no more heads; a log authorized after it was named
   shows when it next grows.
@@ -158,7 +159,8 @@ encoding, which carries its log's key and ID.
 - One watch stream per connection, which takes one of its `MaxStreams` slots; a second is ERROR 2. It leaves the count of
   `MaxTotalStreams` when its first request is read and is counted in a watch count with the same bound, so idle watchers
   do not take the slots that serve pulls. A request that would make the stream watch more than `MaxWatched` logs is ERROR 3 and ends the
-  stream; a malformed request is ERROR 4.
+  stream; so is a request that would take the names watched over all connections past `MaxWatchBytes`, 700 bytes for each name of each
+  connection; a malformed request is ERROR 4.
 
 A server that does not know WATCH_REQ (v0.1.0) answers ERROR 4 and ends the stream, as it does to any type it does not know. WATCH
 is never sent unasked, so a peer that never sends WATCH_REQ sees no change.

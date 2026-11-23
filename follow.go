@@ -1,6 +1,7 @@
 package kolosync
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/ed25519"
@@ -47,6 +48,8 @@ type Follower struct {
 	rnd func(int64) int64
 	// pull is PullWith or PullCiphertext, which tests replace.
 	pull func(ctx context.Context, conn Conn, rep *kolostore.Replica, keysFrom uint64) (uint64, error)
+	// verify is kololog.VerifyHead, which tests count.
+	verify func(pub ed25519.PublicKey, logID kololog.LogID, h kololog.Head) (kololog.VerifiedHead, error)
 
 	mu       sync.Mutex // guards what follows and the fields of followed, link and offer
 	closed   bool
@@ -136,6 +139,7 @@ func NewFollower(opts *FollowOptions) (*Follower, error) {
 	f := &Follower{
 		opts:     o,
 		clk:      realClock,
+		verify:   kololog.VerifyHead,
 		logs:     make(map[logName]*followed),
 		events:   make(map[evKey]FollowEvent),
 		eventsIn: make(chan struct{}, 1),
@@ -319,7 +323,7 @@ func (f *Follower) checkLocal(fl *followed, l *peerLink, v kololog.VerifiedHead)
 
 func (f *Follower) diverge(fl *followed, l *peerLink, err error) {
 	fl.diverged = true
-	ev := FollowEvent{Kind: Diverged, Len: fl.rep.Len(), Err: err}
+	ev := FollowEvent{Kind: FollowDiverged, Len: fl.rep.Len(), Err: err}
 	if l != nil {
 		ev.Peer = l.key
 	}
@@ -356,11 +360,28 @@ func (f *Follower) Status(owner ed25519.PublicKey, logID kololog.LogID) (FollowS
 // FollowEventKind says what happened in a FollowEvent.
 type FollowEventKind int
 
+// The kinds of FollowEvent.
 const (
-	Grew       FollowEventKind = iota + 1 // a pull made the replica longer
-	PullFailed                            // a pull from Peer failed with Err; the next try waits for the backoff
-	Diverged                              // a peer served a second history (Err matches ErrDiverged); the log is no longer pulled
+	// FollowGrew means a pull made the replica longer; Len is the new length.
+	FollowGrew FollowEventKind = iota + 1
+	// FollowPullFailed means a pull from Peer failed with Err; the next try waits for the backoff.
+	FollowPullFailed
+	// FollowDiverged means a peer served a second history (Err matches ErrDiverged); the log is no longer pulled.
+	FollowDiverged
 )
+
+// String returns the kind's name.
+func (k FollowEventKind) String() string {
+	switch k {
+	case FollowGrew:
+		return "grew"
+	case FollowPullFailed:
+		return "pull failed"
+	case FollowDiverged:
+		return "diverged"
+	}
+	return fmt.Sprintf("FollowEventKind(%d)", int(k))
+}
 
 // FollowEvent is something that happened to a followed log.
 type FollowEvent struct {
@@ -387,7 +408,7 @@ func (f *Follower) post(fl *followed, ev FollowEvent) {
 
 func (f *Follower) dropEvents(n logName) {
 	f.order = slices.DeleteFunc(f.order, func(k evKey) bool { return k.name == n })
-	for _, kind := range []FollowEventKind{Grew, PullFailed, Diverged} {
+	for _, kind := range []FollowEventKind{FollowGrew, FollowPullFailed, FollowDiverged} {
 		delete(f.events, evKey{n, kind})
 	}
 }
@@ -561,7 +582,7 @@ func (f *Follower) pulled(ctx context.Context, fl *followed, l *peerLink, before
 	fl.keysFrom = max(fl.keysFrom, keys)
 	if have > before {
 		fl.lastGrown = now
-		f.post(fl, FollowEvent{Kind: Grew, Peer: l.key, Len: have})
+		f.post(fl, FollowEvent{Kind: FollowGrew, Peer: l.key, Len: have})
 		if !fl.diverged {
 			for p, o := range fl.offers {
 				if o.heard && o.size > before && o.size <= have && (p != l || o.size != offered) {
@@ -574,7 +595,7 @@ func (f *Follower) pulled(ctx context.Context, fl *followed, l *peerLink, before
 	fail := func() {
 		o.fails, o.owed = o.fails+1, true
 		o.retryAt = now.Add(backoff.Delay(o.fails, f.opts.RetryMin, f.opts.RetryMax, f.rnd))
-		f.post(fl, FollowEvent{Kind: PullFailed, Peer: l.key, Len: have, Err: err})
+		f.post(fl, FollowEvent{Kind: FollowPullFailed, Peer: l.key, Len: have, Err: err})
 	}
 	switch {
 	case ctx.Err() != nil:
@@ -588,13 +609,13 @@ func (f *Follower) pulled(ctx context.Context, fl *followed, l *peerLink, before
 		f.diverge(fl, l, err)
 	case errors.Is(err, ErrNotFound):
 		o.notFound = true
-		f.post(fl, FollowEvent{Kind: PullFailed, Peer: l.key, Len: have, Err: err})
+		f.post(fl, FollowEvent{Kind: FollowPullFailed, Peer: l.key, Len: have, Err: err})
 	case errors.Is(err, ErrInvalid), errors.Is(err, ErrProtocol), errors.Is(err, ErrTooLarge):
 		o.blocked = true
-		f.post(fl, FollowEvent{Kind: PullFailed, Peer: l.key, Len: have, Err: err})
+		f.post(fl, FollowEvent{Kind: FollowPullFailed, Peer: l.key, Len: have, Err: err})
 	case errors.Is(err, kolostore.ErrClosed), errors.Is(err, kolostore.ErrCorrupt), f.pullRunning(fl, err):
 		fl.hold = now.Add(f.opts.RetryMin)
-		f.post(fl, FollowEvent{Kind: PullFailed, Peer: l.key, Len: have, Err: err})
+		f.post(fl, FollowEvent{Kind: FollowPullFailed, Peer: l.key, Len: have, Err: err})
 	default:
 		fail()
 	}
@@ -797,11 +818,17 @@ func (l *peerLink) head(nm *names, b []byte) error {
 	}
 	l.f.mu.Lock()
 	fl := l.f.logs[n]
+	verify, seen := l.f.verify, false
+	if fl != nil {
+		// A head the peer already offered and that verified needs no second signature check.
+		o := fl.offers[l]
+		seen = o != nil && o.heard && !o.notFound && bytes.Equal(o.head.Head().Encode(), b)
+	}
 	l.f.mu.Unlock()
-	if fl == nil {
+	if fl == nil || seen {
 		return nil
 	}
-	v, err := kololog.VerifyHead(fl.rep.Header().LogKey, fl.rep.ID(), h)
+	v, err := verify(fl.rep.Header().LogKey, fl.rep.ID(), h)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalid, err)
 	}

@@ -149,6 +149,19 @@ func TestDecodeRejectsWatch(t *testing.T) {
 	if _, err := decode(append([]byte{version, tWatch, 1}, putBytes(nil, head)...), false); err != nil {
 		t.Errorf("WATCH with one head: %v", err)
 	}
+	heads := func(n int) []byte {
+		b := binary.AppendUvarint([]byte{version, tWatch}, uint64(n))
+		for range n {
+			b = putBytes(b, head)
+		}
+		return b
+	}
+	if _, err := decode(heads(watchBatch), false); err != nil {
+		t.Errorf("WATCH with %d heads: %v", watchBatch, err)
+	}
+	if _, err := decode(heads(watchBatch+1), false); !errors.Is(err, ErrProtocol) {
+		t.Errorf("WATCH with %d heads: %v, want ErrProtocol", watchBatch+1, err)
+	}
 }
 
 func TestDecodeRejects(t *testing.T) {

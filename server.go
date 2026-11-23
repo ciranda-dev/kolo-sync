@@ -51,6 +51,7 @@ type Server struct {
 	held      atomic.Int64  // bytes reserved for answers that are built or being written
 	refused   atomic.Uint64 // streams and answers refused because a server-wide limit was reached
 	watching  atomic.Int64  // watch streams, which leave taken once their first request is read
+	wheld     atomic.Int64  // bytes reserved for the names watched, over all connections
 
 	wmu   sync.Mutex // guards wlogs, wopen, wloop and the watchers of each wlog
 	wlogs map[logName]*wlog
@@ -68,7 +69,12 @@ const (
 	DefaultMaxWatched = 8192
 	// DefaultWatchGap is the default ServerOptions.WatchGap.
 	DefaultWatchGap = 100 * time.Millisecond
+	// DefaultMaxWatchBytes is the default ServerOptions.MaxWatchBytes, a quarter of DefaultMaxAnswerBytes.
+	DefaultMaxWatchBytes = 64 << 20
 )
+
+// watchNameBytes is what a connection's watched name is charged against MaxWatchBytes: about 590 bytes measured, rounded up.
+const watchNameBytes = 700
 
 // ServerOptions are the limits a Server applies over all the connections it serves, on top of MaxStreams for each.
 // A zero field is its default. A stream or an answer over a limit is answered busy, which a Pull or Fetch returns as ErrBusy.
@@ -82,6 +88,9 @@ type ServerOptions struct {
 	MaxWatched int
 	// WatchGap is the least time between two pushes on a watch stream, at least 10 ms.
 	WatchGap time.Duration
+	// MaxWatchBytes is the most memory the names watched may hold over all connections, each name of each connection
+	// counting 700 bytes; at least as many names as one WATCH_REQ holds. A request past it is answered too large.
+	MaxWatchBytes int64
 }
 
 // logName is a log's owner key and log ID.
@@ -100,13 +109,14 @@ func nameOf(owner ed25519.PublicKey, logID kololog.LogID) (logName, bool) {
 type ServerStats struct {
 	BytesSent      uint64 // frame bytes written, every answer included
 	ActiveStreams  int    // streams being served now, refused ones not included
-	RefusedByLimit uint64 // streams and answers refused because MaxTotalStreams or MaxAnswerBytes was reached
+	RefusedByLimit uint64 // streams, answers and watched names refused because MaxTotalStreams, MaxAnswerBytes or MaxWatchBytes was reached
 	AnswerBytes    int64  // memory the answers being built or written hold now, counted as MaxAnswerBytes counts it
+	WatchBytes     int64  // memory the watched names hold now, counted as MaxWatchBytes counts it
 }
 
 // Stats returns the server's totals; it is safe to call at any time.
 func (s *Server) Stats() ServerStats {
-	return ServerStats{BytesSent: s.sent.Load(), ActiveStreams: int(s.active.Load()), RefusedByLimit: s.refused.Load(), AnswerBytes: s.held.Load()}
+	return ServerStats{BytesSent: s.sent.Load(), ActiveStreams: int(s.active.Load()), RefusedByLimit: s.refused.Load(), AnswerBytes: s.held.Load(), WatchBytes: s.wheld.Load()}
 }
 
 // write sends m and counts its bytes.
@@ -130,7 +140,8 @@ func NewServer(authorize func(peer, owner ed25519.PublicKey, logID kololog.LogID
 }
 
 // NewServerWith is NewServer with the server-wide limits of opts; nil is all defaults.
-// A negative limit, a MaxAnswerBytes below 2 * MaxMessageSize, a MaxWatched below 55 or a WatchGap below 10 ms is ErrInvalidArgument.
+// A negative limit, a MaxAnswerBytes below 2 * MaxMessageSize, a MaxWatched below 55, a MaxWatchBytes below 55 names
+// or a WatchGap below 10 ms is ErrInvalidArgument.
 func NewServerWith(authorize func(peer, owner ed25519.PublicKey, logID kololog.LogID) Access, opts *ServerOptions) (*Server, error) {
 	var o ServerOptions
 	if opts != nil {
@@ -138,6 +149,7 @@ func NewServerWith(authorize func(peer, owner ed25519.PublicKey, logID kololog.L
 	}
 	if o.MaxTotalStreams < 0 || o.MaxAnswerBytes < 0 || (o.MaxAnswerBytes != 0 && o.MaxAnswerBytes < 2*MaxMessageSize) ||
 		(o.MaxWatched != 0 && o.MaxWatched < maxWatchItems) ||
+		o.MaxWatchBytes < 0 || (o.MaxWatchBytes != 0 && o.MaxWatchBytes < maxWatchItems*watchNameBytes) ||
 		(o.WatchGap != 0 && o.WatchGap < 10*time.Millisecond) {
 		return nil, ErrInvalidArgument
 	}
@@ -152,6 +164,9 @@ func NewServerWith(authorize func(peer, owner ed25519.PublicKey, logID kololog.L
 	}
 	if o.WatchGap == 0 {
 		o.WatchGap = DefaultWatchGap
+	}
+	if o.MaxWatchBytes == 0 {
+		o.MaxWatchBytes = DefaultMaxWatchBytes
 	}
 	return &Server{authorize: authorize, logs: make(map[logName]Source), wlogs: make(map[logName]*wlog), limits: o}, nil
 }
@@ -821,13 +836,13 @@ func (wl *wlog) snapshot() (uint64, []byte) {
 	return wl.size, wl.head
 }
 
-// watchNames adds the logs of a WATCH_REQ to w and returns codeTooLarge if that is more than MaxWatched.
+// watchNames adds the logs of a WATCH_REQ to w and returns codeTooLarge if that is more than MaxWatched or MaxWatchBytes allows.
 func (s *Server) watchNames(w *watcher, items []watchItem) uint64 {
 	for _, it := range items {
 		n := logName{owner: it.owner, id: it.logID}
 		e := w.names[n]
 		if e == nil {
-			if len(w.names) >= s.limits.MaxWatched {
+			if len(w.names) >= s.limits.MaxWatched || !s.take(&s.wheld, watchNameBytes, s.limits.MaxWatchBytes) {
 				return codeTooLarge
 			}
 			s.wmu.Lock()
@@ -911,6 +926,7 @@ func (s *Server) watchClose(w *watcher) {
 			delete(s.wlogs, n)
 		}
 	}
+	s.wheld.Add(-int64(len(w.names)) * watchNameBytes)
 	s.wopen--
 	var l *watchLoop
 	if s.wopen == 0 {
