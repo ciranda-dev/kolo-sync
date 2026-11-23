@@ -25,6 +25,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- `ServerOptions.PeerBytesPerSecond` (default 32 MiB, `DefaultPeerBytesPerSecond`) and `ServerOptions.PeerBurstBytes` (default 256 MiB,
+  `DefaultPeerBurstBytes`, at least 2 × `MaxMessageSize`): a token bucket of the bytes of ENTRIES, FETCH and STATE answers for each peer
+  key over all its connections. An answer the bucket cannot pay for is answered ERROR 2 (busy), which a `Pull` or `Fetch` returns as
+  `ErrBusy` and counts in `ServerStats.RefusedByLimit`; it ends only that stream, and other peers and the peer's other streams go on. Before, a peer
+  that pulled the same large log again and again was served without end. Negative is `ErrInvalidArgument`; no wire change.
+  Not breaking in the API, but a peer that pulls more than 256 MiB faster than 32 MiB a second is now answered busy: raise both fields for a server whose peers need more.
 - WATCH_REQ and WATCH (types 14 and 15): a stream that starts with WATCH_REQ is answered with the heads of the logs it
   names, and then with the head of each that grows, at most once per `ServerOptions.WatchGap` (default 100 ms). A log that
   is missing, not offered or not authorized is never in a WATCH. The server probes each watched log once per gap with a read
