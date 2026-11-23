@@ -14,12 +14,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - A WATCH of more than 256 heads, the most a server sends in one, is `ErrProtocol` for a follower, and a follower checks the
   signature of a head once for each peer that offers it. Before, one 4 MiB WATCH could hold 32,263 heads, 1.1 s of
   signature checks. Not breaking: WATCH is not in v0.1.0.
-- Breaking: `MinRate` is replaced by `MinProgress`. A message read is no longer cut off when its average speed is
+- **Breaking:** `MinRate` is replaced by `MinProgress`. A message read is no longer cut off when its average speed is
   below 16 KiB/s: it may take as long as it needs while each 16 KiB of it arrives within `Timeout` (60 s), and a peer
   that sends less than 16 KiB in a minute is cut off after one `Timeout`. A message written may take `Timeout` plus its
   size at 500 bytes a second (about 36 minutes for 1 MiB) instead of at 16 KiB/s, so a peer that barely reads cannot
   hold an answer's memory for hours. An answer of about 1 MiB over a path slower than about 8.5 KB/s used to be cut off
   and asked for again from its first byte, so a pull on such a path never finished.
+- **Breaking:** a server answers busy (ERROR 2, `ErrBusy` at the client) to a peer key that pulls more than 256 MiB of ENTRIES, FETCH
+  and STATE answers faster than 32 MiB a second, over all its connections; v0.1.0 served it without end. The budget is
+  `ServerOptions.PeerBytesPerSecond` and `ServerOptions.PeerBurstBytes` (below), on by default: raise both for a server whose
+  peers legitimately pull more, or set them to a rate and a bucket no pull can use up (1 TiB for both, as the measurements in docs/limits.md do) to turn it off.
 - A request announced larger than 4 KiB is refused with `ErrTooLarge` before its body is read, so no buffer is held
   for a request that trickles in. Every request kolo-sync sends is below 100 bytes.
 
@@ -30,7 +34,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   key over all its connections. An answer the bucket cannot pay for is answered ERROR 2 (busy), which a `Pull` or `Fetch` returns as
   `ErrBusy` and counts in `ServerStats.RefusedByLimit`; it ends only that stream, and other peers and the peer's other streams go on. Before, a peer
   that pulled the same large log again and again was served without end. Negative is `ErrInvalidArgument`; no wire change.
-  Not breaking in the API, but a peer that pulls more than 256 MiB faster than 32 MiB a second is now answered busy: raise both fields for a server whose peers need more.
+  The default is a behavior change, see Changed.
 - WATCH_REQ and WATCH (types 14 and 15): a stream that starts with WATCH_REQ is answered with the heads of the logs it
   names, and then with the head of each that grows, at most once per `ServerOptions.WatchGap` (default 100 ms). A log that
   is missing, not offered or not authorized is never in a WATCH. The server probes each watched log once per gap with a read

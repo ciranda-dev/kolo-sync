@@ -153,7 +153,7 @@ func NewServer(authorize func(peer, owner ed25519.PublicKey, logID kololog.LogID
 }
 
 // NewServerWith is NewServer with the server-wide limits of opts; nil is all defaults.
-// A negative limit, a MaxAnswerBytes below 2 * MaxMessageSize, a MaxWatched below 55, a MaxWatchBytes below 55 names
+// A negative limit, a MaxAnswerBytes below 2 * MaxMessageSize, a MaxWatched below 55, a MaxWatchBytes below 55 names,
 // a WatchGap below 10 ms, a negative PeerBytesPerSecond or a PeerBurstBytes below 2 * MaxMessageSize is ErrInvalidArgument.
 func NewServerWith(authorize func(peer, owner ed25519.PublicKey, logID kololog.LogID) Access, opts *ServerOptions) (*Server, error) {
 	var o ServerOptions
