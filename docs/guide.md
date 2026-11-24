@@ -196,8 +196,8 @@ link allow. The wire format is in [protocol.md](protocol.md#streamed-entries).
   pull completes, and `rep.Len()` is where the next `Pull` resumes. The
   answers that had arrived whole before a failure, such as a lost connection,
   are stored first. Errors, `ctx` and the per-message deadlines are as
-  with one request at a time: every message may take `Timeout` plus its size at
-  `MinRate`, and a done `ctx` returns `ctx.Err()`. A peer that stops sending in
+  with one request at a time: every message may take as long as it needs while
+  each `MinProgress` bytes of it move within `Timeout`, and a done `ctx` returns `ctx.Err()`. A peer that stops sending in
   the middle of the credit is `ErrTimeout`.
 - The answers a pull holds that are not stored yet never pass 6 MiB, whatever
   `InFlight` is; see [limits.md](limits.md). A pull with answers of 1 MiB
@@ -220,6 +220,7 @@ goroutine, as often as you like; the last snapshot is the result's. A meter meas
 | `Streamed` | the peer streamed the entries; false for a peer that does not know STREAM_REQ |
 | `Elapsed` | time since the pull started, or its length once it ended |
 | `Bytes`, `Entries`, `Answers`, `AvgAnswer()` | ENTRIES answers read: message bytes, entries, messages, average size |
+| `Received` | message bytes of ENTRIES answers taken off the stream so far, also of the one being read: a progress count that moves with the bytes, while `Bytes` moves once per answer |
 | `Requests` | requests for entries sent |
 | `ReaderWait` | time the reader spent reading answers, waiting for their bytes, not counting memory waits |
 | `CommitBusy`, `CommitIdle` | time the goroutine that verifies and stores spent doing it, and waiting for an answer |

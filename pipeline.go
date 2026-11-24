@@ -334,6 +334,10 @@ func (p *pipe) receive(entries bool, peek func(n int, b []byte) error) (m messag
 	frame := 0
 	start := time.Now()
 	var inHooks time.Duration
+	var got func(int)
+	if entries {
+		got = p.meter.received
+	}
 	m, err = readAnswer(p.c.st, frameHooks{
 		size: func(n int) error {
 			t := time.Now()
@@ -351,6 +355,7 @@ func (p *pipe) receive(entries bool, peek func(n int, b []byte) error) (m messag
 			return nil
 		},
 		peek: peek,
+		got:  got,
 	})
 	p.meter.readerWait(time.Since(start) - inHooks)
 	if err != nil {
@@ -358,7 +363,7 @@ func (p *pipe) receive(entries bool, peek func(n int, b []byte) error) (m messag
 			p.mem.release(held)
 		}
 		if errors.Is(err, errStopped) {
-			_, _ = io.CopyN(io.Discard, p.c.st, int64(frame))
+			_, _ = io.CopyN(io.Discard, &paced{st: p.c.st}, int64(frame))
 		}
 		return message{}, 0, err
 	}
@@ -437,7 +442,7 @@ func (p *pipe) readChunk(next uint64) (it *answer, k uint64, err error) {
 		inHooks += time.Since(t)
 		held = n
 		return nil
-	}})
+	}, got: p.meter.received})
 	p.meter.readerWait(time.Since(start) - inHooks)
 	if dropped {
 		k, err := p.drop(frame, next)
@@ -473,23 +478,20 @@ func (p *pipe) readChunk(next uint64) (it *answer, k uint64, err error) {
 // drop reads and discards the rest of an answer of n bytes that starts at next, and the proof of its end. It returns the
 // answer's entry count.
 func (p *pipe) drop(n int, next uint64) (uint64, error) {
-	st := p.c.st
-	if err := st.SetReadDeadline(time.Now().Add(timeout + allowance(n))); err != nil {
-		return 0, ioErr(err)
-	}
+	r := &paced{st: p.c.st}
 	b := make([]byte, min(n, peekSize))
-	if _, err := io.ReadFull(st, b); err != nil {
+	if _, err := io.ReadFull(r, b); err != nil {
 		return 0, ioErr(err)
 	}
 	k, ok := entriesCount(b)
 	if !ok {
 		return 0, fmt.Errorf("%w: unexpected message", ErrProtocol)
 	}
-	if _, err := io.CopyN(io.Discard, st, int64(n-len(b))); err != nil {
+	if _, err := io.CopyN(io.Discard, r, int64(n-len(b))); err != nil {
 		return 0, ioErr(err)
 	}
 	if k > 0 && k < p.size-next {
-		return k, discardMsg(st)
+		return k, discardMsg(p.c.st)
 	}
 	return k, nil
 }

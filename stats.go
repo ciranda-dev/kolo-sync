@@ -17,6 +17,10 @@ type PullStats struct {
 	Bytes   uint64
 	Entries uint64
 	Answers uint64
+	// Received counts the message bytes of ENTRIES answers, or of an error in their place, taken off the stream so far,
+	// also of the one being read, in steps of 16 KiB or more, so it moves as the bytes arrive while Bytes moves once an
+	// answer is whole. An answer cut off midway stays counted.
+	Received uint64
 	// Requests counts the requests for entries sent: ENTRIES_REQ, or STREAM_REQ and CREDIT_REQ.
 	Requests uint64
 	// ReaderWait is the time the reader spent waiting for the bytes of answers, not counting waits for memory.
@@ -175,6 +179,13 @@ func (m *PullMeter) memory(held int, waited time.Duration) {
 		m.s.MemoryBlocked++
 		m.s.MemoryWait += waited
 	}
+	m.mu.Unlock()
+}
+
+// received counts n more bytes of an ENTRIES answer read off the stream.
+func (m *PullMeter) received(n int) {
+	m.mu.Lock()
+	m.s.Received += uint64(n)
 	m.mu.Unlock()
 }
 
