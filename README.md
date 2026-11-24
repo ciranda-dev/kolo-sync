@@ -130,6 +130,7 @@ A log is named by its owner's public key and its log ID everywhere: in `Offer`, 
 | `Pull` | Bring a replica up to date: entries, delete markers and, when the peer gives them, entry keys |
 | `PullCiphertext` | `Pull` for a peer that must never hold entry keys, such as a pinning node |
 | `PullWith` | `Pull` with `PullOptions`: `NoMarkers` stores no delete marker from the peer, `KeysFrom` starts the key scan at a cursor it returns, `InFlight` sets how far a pull asks ahead (a pull streams entries, so the link stays full on a long round trip), `Meter` gives live statistics, and `PullResult.Stats` says where the time went |
+| `NewFollower`, `Follower` | Keep replicas up to date from the connections given to `Follow`: new heads arrive by WATCH, each followed log is pulled, failed pulls are retried with backoff and jitter, and `Next` reports `Grew`, `PullFailed` and `Diverged`; a peer of v0.1.0 is pulled once and asked for heads every `Poll`, if set. `Add`, `Remove`, `Hint`, `Status` and `Close` manage it |
 | `FetchHeader`, `FetchHead` | The log's signed header, to open a replica, and the peer's signed head |
 | `Fetch` | A range of entries, each checked against a head you trust, without a replica |
 | `FetchWithKeys` | `Fetch` with entry keys you hold, to read from a peer that serves ciphertext only |

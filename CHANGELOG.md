@@ -27,6 +27,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - `ServerOptions.MaxWatched` (default 1024, at least 55): the most distinct logs a connection may watch, ERROR 3 past it.
   One watch stream per connection; watch streams are counted apart from `MaxTotalStreams`, so idle watchers do not take the
   slots that serve pulls. A server of v0.1.0 answers WATCH_REQ with ERROR 4.
+- `Follower` (`NewFollower`, `Add`, `Remove`, `Follow`, `Hint`, `Status`, `Next`, `Close`): keeps replicas up to date from every connection
+  given to `Follow`. It names the followed logs in a WATCH_REQ, pulls a log when a verified head is larger than the replica,
+  checks a head no larger than the replica locally so that a second history is `ErrDiverged`, pulls a log from one peer at a
+  time and not from a peer in backoff, and retries a failed pull per peer and log with exponential backoff and jitter
+  (`RetryMin` 1 s, `RetryMax` 10 min). A peer that answers WATCH_REQ with ERROR 4 is pulled once and asked for heads every
+  `Poll` if that is set (0 by default). It keeps no state on disk and forwards no head.
 - `PullStats.Received`: the bytes of ENTRIES answers read so far, also of the answer being read, for progress that
   moves with the bytes instead of once per answer.
 

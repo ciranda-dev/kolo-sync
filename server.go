@@ -64,7 +64,7 @@ const (
 	// DefaultMaxAnswerBytes is the default ServerOptions.MaxAnswerBytes, a quarter of kolo-transport's DefaultMaxMemory (1 GiB),
 	// which leaves the rest of that budget to the connections themselves.
 	DefaultMaxAnswerBytes = 256 << 20
-	// DefaultMaxWatched is the default ServerOptions.MaxWatched: heads of that many logs fit in one or two WATCH messages.
+	// DefaultMaxWatched is the default ServerOptions.MaxWatched.
 	DefaultMaxWatched = 1024
 	// DefaultWatchGap is the default ServerOptions.WatchGap.
 	DefaultWatchGap = 100 * time.Millisecond
@@ -78,8 +78,7 @@ type ServerOptions struct {
 	// MaxAnswerBytes is the most memory the answers being built or written may hold at once; each answer counts twice its
 	// size, the entries read from the log and the frame sent. At least 2 * MaxMessageSize, so one largest answer always fits.
 	MaxAnswerBytes int64
-	// MaxWatched is the most distinct logs one connection may watch; a request past it is answered too large.
-	// At least 55, so one full WATCH_REQ fits.
+	// MaxWatched is the most distinct logs one connection may watch, at least 55; a request past it is answered too large.
 	MaxWatched int
 	// WatchGap is the least time between two pushes on a watch stream, from 10 ms to 10 s.
 	WatchGap time.Duration
@@ -244,7 +243,7 @@ func (s *Server) Serve(ctx context.Context, conn Conn) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	slots := make(chan struct{}, MaxStreams)
-	var hasWatch atomic.Bool // a connection has one watch stream
+	var hasWatch atomic.Bool
 	for {
 		st, err := conn.AcceptStream(ctx)
 		if err != nil {
@@ -315,7 +314,7 @@ func (s *Server) lookup(peer, owner ed25519.PublicKey, logID kololog.LogID) (Sou
 	return src, a
 }
 
-// serveStream serves one stream and reports whether it became a watch stream, counted in watching instead of taken.
+// serveStream reports whether the stream became a watch stream, which is counted in watching, not taken.
 func (s *Server) serveStream(ctx context.Context, peer ed25519.PublicKey, st *kolotransport.Stream, hasWatch *atomic.Bool) (watching bool) {
 	s.active.Add(1)
 	defer s.active.Add(-1)
@@ -634,8 +633,7 @@ func state(src Source, keys bool, start, end uint64) (message, uint64) {
 	return m, 0
 }
 
-// wlog is the head cache of a watched log, shared by every stream that watches it: a log is probed with its cached
-// size and its head is read, which signs it if the log is ours, only after it grew.
+// wlog caches the head of a watched log for every stream that watches it, so that a head is signed only after growth.
 type wlog struct {
 	mu       sync.Mutex
 	size     uint64 // size of head, 0 before a head was read
@@ -643,21 +641,18 @@ type wlog struct {
 	watchers map[*watcher]struct{}
 }
 
-// watcher is one watch stream: the logs it names and the size of each it has been told of.
 type watcher struct {
 	names map[logName]*watched // used by the stream's goroutine only
 	wake  chan struct{}
 }
 
-// watched is a log a stream names. sent is the size the stream holds or was sent; named is set until the log is first
-// answered after being named, when a head of exactly that size is sent too.
+// watched is a log a stream names; sent is the size the stream holds or was sent, and named makes a head of exactly that size count once.
 type watched struct {
 	wl    *wlog
 	sent  uint64
 	named bool
 }
 
-// push is a head to send to a stream and the size to record once it is sent.
 type push struct {
 	e    *watched
 	size uint64
@@ -671,11 +666,10 @@ type watchIn struct {
 
 type watchLoop struct{ stop, done chan struct{} }
 
-// watchBatch is the most heads in one WATCH, so that it is far below MaxMessageSize even at the largest legal head.
+// watchBatch keeps a WATCH far below MaxMessageSize at the largest legal head.
 const watchBatch = answerBudget / maxSmall
 
 // serveWatch serves a watch stream whose first request is m, and reports whether the stream left taken for watching.
-// A WATCH answers each request within WatchGap, and then carries the head of a log whenever it grew, at most once a gap.
 func (s *Server) serveWatch(ctx context.Context, peer ed25519.PublicKey, st *kolotransport.Stream, m message, hasWatch *atomic.Bool) (watching bool) {
 	fail := func(code uint64) { _ = s.write(st, message{typ: tError, code: code}) }
 	if !hasWatch.CompareAndSwap(false, true) {
@@ -696,7 +690,7 @@ func (s *Server) serveWatch(ctx context.Context, peer ed25519.PublicKey, st *kol
 	go func() {
 		defer close(rdone)
 		for {
-			m, err := readWatchMsg(st)
+			m, err := readWatchMsg(st, true)
 			select {
 			case in <- watchIn{m, err}:
 			case <-quit:
@@ -713,7 +707,7 @@ func (s *Server) serveWatch(ctx context.Context, peer ed25519.PublicKey, st *kol
 		<-rdone
 	}()
 
-	var next time.Time // the earliest time of the next push
+	var next time.Time
 	var answer, grown bool
 	timer := time.NewTimer(0)
 	defer timer.Stop()
@@ -773,9 +767,8 @@ func (s *Server) serveWatch(ctx context.Context, peer ed25519.PublicKey, st *kol
 	}
 }
 
-// pushWatch sends the heads that stream w has not been told of, in WATCH messages, preceded by an empty one if due
-// and there are none. sent is false if an answer was refused for MaxAnswerBytes before all were sent, alive if the
-// stream can still be written to.
+// pushWatch sends the heads w has not been told of, an empty WATCH if due and none; sent is false if MaxAnswerBytes
+// refused one, alive if the stream can still be written to.
 func (s *Server) pushWatch(st *kolotransport.Stream, peer ed25519.PublicKey, w *watcher, due bool) (sent, alive bool) {
 	pushes := w.collect(s, peer)
 	for first := true; first || len(pushes) > 0; first = false {
@@ -804,8 +797,7 @@ func (s *Server) pushWatch(st *kolotransport.Stream, peer ed25519.PublicKey, w *
 	return true, true
 }
 
-// collect returns the heads to send to w: the head of a log that grew past what w was told of, or, for a log just
-// named, of its size or more. The logs the peer may not read are asked again only after they grow.
+// collect returns the heads to send to w: of the logs that grew past what w was told of, or that it just named at their size.
 func (w *watcher) collect(s *Server, peer ed25519.PublicKey) []push {
 	var out []push
 	for n, e := range w.names {
@@ -829,8 +821,7 @@ func (wl *wlog) snapshot() (uint64, []byte) {
 	return wl.size, wl.head
 }
 
-// watchNames adds the logs of a WATCH_REQ to w, or replaces the length it holds of a log it names again. It returns
-// codeTooLarge if w would watch more than MaxWatched logs.
+// watchNames adds the logs of a WATCH_REQ to w and returns codeTooLarge if that is more than MaxWatched.
 func (s *Server) watchNames(w *watcher, items []watchItem) uint64 {
 	for _, it := range items {
 		n := logName{owner: it.owner, id: it.logID}
@@ -856,9 +847,7 @@ func (s *Server) watchNames(w *watcher, items []watchItem) uint64 {
 	return 0
 }
 
-// refresh reads the head of log n into wl if the log grew past it, and wakes the streams that watch it. The log is
-// probed with the record just past the cached head, which is read from memory, so a log that did not grow is never
-// signed.
+// refresh reads the head of log n into wl only if the log grew past it, probed by a read from memory, so that a log that did not grow is never signed.
 func (s *Server) refresh(n logName, wl *wlog) {
 	s.mu.RLock()
 	src := s.logs[n]
@@ -902,7 +891,6 @@ func (s *Server) forget(n logName) {
 	}
 }
 
-// watchOpen counts a watch stream and starts the loop that probes watched logs if it is the first.
 func (s *Server) watchOpen() {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
@@ -914,7 +902,6 @@ func (s *Server) watchOpen() {
 	}
 }
 
-// watchClose forgets w, and stops the loop if it was the last stream.
 func (s *Server) watchClose(w *watcher) {
 	s.wmu.Lock()
 	for n := range w.names {
@@ -936,7 +923,6 @@ func (s *Server) watchClose(w *watcher) {
 	}
 }
 
-// runWatchLoop probes every watched log once per WatchGap.
 func (s *Server) runWatchLoop(l *watchLoop) {
 	defer close(l.done)
 	t := time.NewTicker(s.limits.WatchGap)

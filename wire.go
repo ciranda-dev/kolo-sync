@@ -43,8 +43,7 @@ const (
 	overhead  = 32                         // upper bound of a message's header fields, or of one item's
 	maxScan   = MaxMessageSize / minSigned // entries one STATE answer looks at: as many as one ENTRIES answer can hold
 
-	// maxWatchItems is the most logs in one WATCH_REQ: the request bound (maxSmall) less its version, type and count
-	// bytes, over the largest item, two keys and a 10-byte uvarint.
+	// maxWatchItems is the most items a WATCH_REQ of maxSmall bytes holds at their largest encoding.
 	maxWatchItems = (maxSmall - 3) / (keySize + kololog.LogIDSize + binary.MaxVarintLen64)
 )
 
@@ -89,11 +88,10 @@ type message struct {
 	items   []item          // tState
 	code    uint64          // tError
 	credit  uint64          // tStreamReq, tCreditReq: bytes of ENTRIES answers the peer may send
-	watch   []watchItem     // tWatchReq
-	heads   [][]byte        // tWatch: encoded heads
+	watch   []watchItem
+	heads   [][]byte
 }
 
-// watchItem is a log named in WATCH_REQ and the length the watcher holds of it.
 type watchItem struct {
 	owner [keySize]byte
 	logID kololog.LogID
@@ -354,7 +352,6 @@ func decodeEntries(d *kolocodec.Decoder, proofs bool) (out []kololog.Entry, ps [
 	return out, ps, nil
 }
 
-// decodeWatchReq decodes the one to maxWatchItems logs of WATCH_REQ.
 func decodeWatchReq(d *kolocodec.Decoder) ([]watchItem, error) {
 	n, err := d.UvarintMax(min(maxWatchItems, uint64(d.Len()/(keySize+kololog.LogIDSize+1))))
 	if err != nil {
@@ -382,7 +379,6 @@ func decodeWatchReq(d *kolocodec.Decoder) ([]watchItem, error) {
 	return out, nil
 }
 
-// decodeHeads decodes the heads of WATCH, each between minSigned and maxSmall bytes.
 func decodeHeads(d *kolocodec.Decoder) ([][]byte, error) {
 	n, err := d.UvarintMax(uint64(d.Len() / (minSigned + 2)))
 	if err != nil || n == 0 {
@@ -603,16 +599,15 @@ func readMsg(st *kolotransport.Stream, requests bool) (message, error) {
 	return readFrame(r, requests, func(int) { r.restart() })
 }
 
-// readWatchMsg reads one request on a watch stream, which is idle by design: it waits for the first byte with no
-// deadline, then reads the message as readMsg does.
-func readWatchMsg(st *kolotransport.Stream) (message, error) {
+// readWatchMsg is readMsg with no deadline for the first byte, since a watch stream is idle by design.
+func readWatchMsg(st *kolotransport.Stream, requests bool) (message, error) {
 	_ = st.SetReadDeadline(time.Time{})
 	var b [1]byte
 	if _, err := io.ReadFull(st, b[:]); err != nil {
 		return message{}, ioErr(err)
 	}
 	r := &paced{st: st}
-	return readFrame(io.MultiReader(bytes.NewReader(b[:]), r), true, func(int) { r.restart() })
+	return readFrame(io.MultiReader(bytes.NewReader(b[:]), r), requests, func(int) { r.restart() })
 }
 
 // discardMsg reads and drops one message, with the deadlines of readMsg; it checks only the length.
