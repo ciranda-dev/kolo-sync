@@ -16,12 +16,12 @@ github.com/ciranda-dev/kolo-id v0.1.0 h1:h7kCrm4W71gLdM41D1hh5gqEyi36nG+4fchh3TL
 github.com/ciranda-dev/kolo-id v0.1.0/go.mod h1:UBOurs+UF4Vk2ZZET2BHu04Y38QWelxw2c5EPqLd47g=
 github.com/ciranda-dev/kolo-log v0.1.0 h1:cYszZoFn6fOWeWZcpirCekuvOZCH68iE/FIXBRAuF44=
 github.com/ciranda-dev/kolo-log v0.1.0/go.mod h1:2k8t7vt7GIn/Nf+fDvOC/yrxJZJOvOywVZ5kbTmYmxE=
-github.com/ciranda-dev/kolo-secure v0.1.0 h1:OijocwGf2qT97j1CAo3FlxTixvaWOw+bJaPCJNQa15s=
-github.com/ciranda-dev/kolo-secure v0.1.0/go.mod h1:WyD5IC+aDJEJVFHAQQsASMm10mnBCTBme3IzCniTbD4=
+github.com/ciranda-dev/kolo-secure v0.1.1 h1:ipGcoGw/DM+50nKbQV05khCMf3T3YvAPwChQ+aOZ3rs=
+github.com/ciranda-dev/kolo-secure v0.1.1/go.mod h1:mWVRE8zjeNPL6VQ0L8Cvj479wlDiiUPL5lE5RXJQ6qQ=
 github.com/ciranda-dev/kolo-store v0.1.0 h1:K82UgSqTtqVcVC9W/a4ruSjFC41a01SvyJAzfjnGSNM=
 github.com/ciranda-dev/kolo-store v0.1.0/go.mod h1:3NBwBQIidLCC/eL10ntNMbeN6g3XdsKj4WVQBzYoxIw=
-github.com/ciranda-dev/kolo-transport v0.1.0 h1:0RM5AOtJJtBMArs6OEyuf7LxLAJH1qMbfZ+MKJ4LcIw=
-github.com/ciranda-dev/kolo-transport v0.1.0/go.mod h1:M9Ta/MtnkAxFFJdOortYQYO4QO7tidvyYSK2mlQPEU8=
+github.com/ciranda-dev/kolo-transport v0.1.1 h1:gbfjZCDLdRKU++0X6ievYUwhTpOl/nX9YniVz+GhFf8=
+github.com/ciranda-dev/kolo-transport v0.1.1/go.mod h1:M9Ta/MtnkAxFFJdOortYQYO4QO7tidvyYSK2mlQPEU8=
 github.com/cockroachdb/crlib v0.0.0-20241112164430-1264a2edc35b h1:SHlYZ/bMx7frnmeqCu+xm0TCxXLzX3jQIVuFbnFGtFU=
 github.com/cockroachdb/crlib v0.0.0-20241112164430-1264a2edc35b/go.mod h1:Gq51ZeKaFCXk6QwuGM0w1dnaOqc/F5zKT2zA9D6Xeac=
 github.com/cockroachdb/datadriven v1.0.3-0.20250407164829-2945557346d5 h1:UycK/E0TkisVrQbSoxvU827FwgBBcZ95nRRmpj/12QI=

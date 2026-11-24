@@ -6,9 +6,9 @@ require (
 	github.com/ciranda-dev/kolo-codec v0.1.0
 	github.com/ciranda-dev/kolo-id v0.1.0
 	github.com/ciranda-dev/kolo-log v0.1.0
-	github.com/ciranda-dev/kolo-secure v0.1.0
+	github.com/ciranda-dev/kolo-secure v0.1.1
 	github.com/ciranda-dev/kolo-store v0.1.0
-	github.com/ciranda-dev/kolo-transport v0.1.0
+	github.com/ciranda-dev/kolo-transport v0.1.1
 )
 
 require (
