@@ -114,7 +114,7 @@ func main() {
 bob read "hello from alice" from 1 entries
 ```
 
-The same program is in [examples/basic](examples/basic). A real application keeps its stores on disk with `kolostore.OpenPebble`.
+The same program is in [examples/basic](examples/basic). [examples/follow](examples/follow) keeps a replica up to date with a `Follower` and restarts it from a Pebble directory. A real application keeps its stores on disk with `kolostore.OpenPebble`.
 
 ## API
 
@@ -122,7 +122,7 @@ A log is named by its owner's public key and its log ID everywhere: in `Offer`, 
 
 | Symbol | What it does |
 |---|---|
-| `NewServer(authorize)`, `NewServerWith` | A server with no offered logs; `authorize` returns `NoAccess`, `Ciphertext` or `Keys` for each request; `NewServerWith` sets the server-wide limits on streams and answer memory, the logs a connection may watch and the gap between pushes |
+| `NewServer(authorize)`, `NewServerWith` | A server with no offered logs; `authorize` returns `NoAccess`, `Ciphertext` or `Keys` for each request; `NewServerWith` sets the server-wide limits on streams and answer memory (`ServerOptions`: `MaxTotalStreams`, `MaxAnswerBytes`), `MaxWatched` and `WatchGap` |
 | `Server.Offer`, `Server.Withdraw` | Make a kolo-store or kolo-log log or replica available, or stop offering it |
 | `Conn` | The connection every call takes: `*kolosecure.Conn`, or `koloswarm.Conn` for a direct or relayed swarm link |
 | `Server.Serve(ctx, conn)` | Answer the streams a peer opens on a connection; one per connection |
@@ -130,13 +130,20 @@ A log is named by its owner's public key and its log ID everywhere: in `Offer`, 
 | `Pull` | Bring a replica up to date: entries, delete markers and, when the peer gives them, entry keys |
 | `PullCiphertext` | `Pull` for a peer that must never hold entry keys, such as a pinning node |
 | `PullWith` | `Pull` with `PullOptions`: `NoMarkers` stores no delete marker from the peer, `KeysFrom` starts the key scan at a cursor it returns, `InFlight` sets how far a pull asks ahead (a pull streams entries, so the link stays full on a long round trip), `Meter` gives live statistics, and `PullResult.Stats` says where the time went |
-| `NewFollower`, `Follower` | Keep replicas up to date from the connections given to `Follow`: new heads arrive by WATCH, each followed log is pulled, failed pulls are retried with backoff and jitter, and `Next` reports `Grew`, `PullFailed` and `Diverged`; a peer of v0.1.0 is pulled once and asked for heads every `Poll`, if set. `Add`, `Remove`, `Hint`, `Status` and `Close` manage it |
+| `NewFollower(opts)`, `FollowOptions` | A follower with bounds on the work peers can ask of it: `MaxPulls` and `MaxPullsPerConn` pulls at once, `RetryMin` and `RetryMax` for the backoff, `Poll` for a peer without WATCH, and `Ciphertext` to pull without entry keys; there is no limit on the number of logs it follows |
+| `Follower.Add`, `Follower.Remove` | Follow a replica, or stop following it; the caller still closes the replica |
+| `Follower.Follow(ctx, conn)` | Watch the logs the peer on `conn` serves for new heads and pull each log that grew, retrying a failed pull with exponential backoff and jitter, until `ctx` or the connection ends; the caller runs `Server.Serve` on the same connection. A peer of v0.1.0 is pulled once and asked for heads every `Poll`, if set |
+| `Follower.Hint(head)` | Give a head learned elsewhere: it is verified, then the log is pulled from a connected peer |
+| `Follower.Status`, `FollowStatus` | `Len`, the `Largest` head size a connected peer offered, `Peers` and `LastGrown` of a followed log |
+| `Follower.Next`, `FollowEvent`, `FollowEventKind` | The next event: `Grew`, `PullFailed` or `Diverged` |
+| `Follower.Close` | End every `Follow` and pull; `Add`, `Follow` and `Next` then return `ErrClosed` |
+| `ServerOptions.MaxWatched`, `ServerOptions.WatchGap`, `DefaultMaxWatched`, `DefaultWatchGap` | The logs one connection may watch (8192) and the least time between two pushes (100 ms), see [limits](docs/limits.md) |
 | `FetchHeader`, `FetchHead` | The log's signed header, to open a replica, and the peer's signed head |
 | `Fetch` | A range of entries, each checked against a head you trust, without a replica |
 | `FetchWithKeys` | `Fetch` with entry keys you hold, to read from a peer that serves ciphertext only |
 | `FetchKeys` | The entry keys of a range from a peer with `Keys` access, without the ciphertexts |
 
-Both ends may serve and pull on one connection. `Conn` needs only `RemotePublicKey`, `OpenStream` and `AcceptStream`; on a relayed link as on a direct one, `authorize` gets the key the peer proved in the end-to-end handshake. Entry keys travel only on that end-to-end encrypted connection, never in an error or a log line. Errors are sentinels for `errors.Is`: `ErrNotFound`, `ErrDiverged`, `ErrMarked`, `ErrBehind`, `ErrKeyMismatch`, `ErrInvalid`, `ErrProtocol`, `ErrBusy`, `ErrTooLarge`, `ErrTimeout` and `ErrInvalidArgument`.
+Both ends may serve and pull on one connection. `Conn` needs only `RemotePublicKey`, `OpenStream` and `AcceptStream`; on a relayed link as on a direct one, `authorize` gets the key the peer proved in the end-to-end handshake. Entry keys travel only on that end-to-end encrypted connection, never in an error or a log line. Errors are sentinels for `errors.Is`: `ErrNotFound`, `ErrDiverged`, `ErrMarked`, `ErrBehind`, `ErrKeyMismatch`, `ErrInvalid`, `ErrProtocol`, `ErrBusy`, `ErrTooLarge`, `ErrTimeout`, `ErrInvalidArgument` and `ErrClosed`.
 
 ## Security notes
 

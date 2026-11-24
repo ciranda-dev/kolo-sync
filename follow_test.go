@@ -107,16 +107,15 @@ func TestNewFollower(t *testing.T) {
 	}{
 		{"nil", nil, true},
 		{"zero", &FollowOptions{}, true},
-		{"set", &FollowOptions{MaxFollowed: 1, MaxPulls: 1, MaxPullsPerConn: MaxStreams - 1, RetryMin: 100 * time.Millisecond, RetryMax: time.Hour, Poll: time.Second}, true},
-		{"negative follow", &FollowOptions{MaxFollowed: -1}, false},
+		{"set", &FollowOptions{MaxPulls: 1, MaxPullsPerConn: MaxStreams - 1, RetryMin: 100 * time.Millisecond, RetryMax: time.Hour, Poll: time.Second}, true},
 		{"negative pulls", &FollowOptions{MaxPulls: -1}, false},
 		{"pulls per connection past the streams", &FollowOptions{MaxPullsPerConn: MaxStreams}, false},
 		{"retry floor too low", &FollowOptions{RetryMin: time.Millisecond}, false},
-		{"retry floor too high", &FollowOptions{RetryMin: 2 * time.Minute}, false},
+		{"retry floor of two minutes", &FollowOptions{RetryMin: 2 * time.Minute}, true},
 		{"ceiling below the floor", &FollowOptions{RetryMin: 10 * time.Second, RetryMax: time.Second}, false},
-		{"ceiling too high", &FollowOptions{RetryMax: 2 * time.Hour}, false},
+		{"ceiling of two hours", &FollowOptions{RetryMax: 2 * time.Hour}, true},
 		{"poll below the floor", &FollowOptions{Poll: 10 * time.Millisecond}, false},
-		{"poll above the ceiling", &FollowOptions{Poll: 11 * time.Minute}, false},
+		{"poll above the retry ceiling", &FollowOptions{Poll: 11 * time.Minute}, true},
 		{"negative poll", &FollowOptions{Poll: -time.Second}, false},
 	} {
 		f, err := NewFollower(tc.opts)
@@ -132,7 +131,7 @@ func TestNewFollower(t *testing.T) {
 func TestFollowAdd(t *testing.T) {
 	checkGoroutines(t)
 	x := newFollow1(t, 2)
-	f := newFollowerT(t, &FollowOptions{MaxFollowed: 1})
+	f := newFollowerT(t, nil)
 	if err := f.Add(nil); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("Add(nil) = %v", err)
 	}
@@ -143,11 +142,29 @@ func TestFollowAdd(t *testing.T) {
 		t.Fatalf("second Add = %v, want ErrInvalidArgument", err)
 	}
 	l2 := ownLog(t, x.a, 1)
-	if err := f.Add(replica(t, x.c, x.conn, pub(x.a), l2.ID())); !errors.Is(err, ErrFollowLimit) {
-		t.Fatalf("Add past MaxFollowed = %v, want ErrFollowLimit", err)
-	}
 	if _, err := f.Status(pub(x.a), l2.ID()); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Status of a log not followed = %v", err)
+	}
+}
+
+// The number of followed logs has no bound: the application chooses its replicas, not a peer.
+func TestFollowAddHasNoCount(t *testing.T) {
+	checkGoroutines(t)
+	a, c := newPeer(t), newPeer(t)
+	f := newFollowerT(t, nil)
+	for range DefaultMaxWatched + 1 {
+		l, err := a.st.Create(a.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { l.Close() })
+		rep, err := c.st.OpenReplica(pub(a), l.ID(), l.Header().Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Add(rep); err != nil {
+			t.Fatalf("Add of log %d: %v", len(f.logs)+1, err)
+		}
 	}
 }
 

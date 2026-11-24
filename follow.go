@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	defaultMaxPulls        = 16
+	defaultMaxPulls        = 32
 	defaultMaxPullsPerConn = MaxStreams - 1 // the peer's server keeps one of its MaxStreams for the watch stream
 	defaultRetryMin        = time.Second
 	defaultRetryMax        = 10 * time.Minute
@@ -29,12 +29,11 @@ const (
 // FollowOptions are a Follower's bounds; a zero field takes its default.
 type FollowOptions struct {
 	Ciphertext      bool          // pull without entry keys, as PullCiphertext
-	MaxFollowed     int           // most logs followed at once, default DefaultMaxWatched; Add returns ErrFollowLimit past it
-	MaxPulls        int           // most pulls at once over all connections, default 16
+	MaxPulls        int           // most pulls at once over all connections, default 32
 	MaxPullsPerConn int           // most pulls at once on one connection, 1 to MaxStreams-1, default MaxStreams-1
-	RetryMin        time.Duration // backoff floor after a failed pull of a log from a peer, 100 ms to 1 minute, default 1 s
-	RetryMax        time.Duration // backoff ceiling, RetryMin to 1 hour, default 10 minutes
-	Poll            time.Duration // how often a peer without WATCH is asked for heads, RetryMin to RetryMax; 0 never
+	RetryMin        time.Duration // backoff floor after a failed pull of a log from a peer, at least 100 ms, default 1 s
+	RetryMax        time.Duration // backoff ceiling, at least RetryMin, default 10 minutes
+	Poll            time.Duration // how often a peer without WATCH is asked for heads, at least RetryMin; 0 never
 }
 
 // Follower keeps the replicas added to it up to date from every connection given to Follow. It is safe for concurrent use.
@@ -92,12 +91,14 @@ type followed struct {
 
 type offer struct {
 	size     uint64 // the largest verified head it offered
+	head     kololog.VerifiedHead
 	heard    bool
 	hinted   uint64 // the hint a pull from it already tried
 	fails    int
 	retryAt  time.Time
 	blocked  bool // it sent data that does not verify, or broke the protocol
 	notFound bool // it does not serve the log
+	owed     bool // its last pull failed, so one more is due even if its head is no larger than the replica
 }
 
 type peerLink struct {
@@ -113,8 +114,6 @@ type peerLink struct {
 }
 
 var (
-	// ErrFollowLimit means a Follower already follows MaxFollowed logs.
-	ErrFollowLimit = errors.New("kolosync: follow limit reached")
 	// ErrClosed means the Follower is closed.
 	ErrClosed = errors.New("kolosync: closed")
 )
@@ -125,14 +124,13 @@ func NewFollower(opts *FollowOptions) (*Follower, error) {
 	if opts != nil {
 		o = *opts
 	}
-	o.MaxFollowed = cmp.Or(o.MaxFollowed, DefaultMaxWatched)
 	o.MaxPulls = cmp.Or(o.MaxPulls, defaultMaxPulls)
 	o.MaxPullsPerConn = cmp.Or(o.MaxPullsPerConn, defaultMaxPullsPerConn)
 	o.RetryMin = cmp.Or(o.RetryMin, defaultRetryMin)
 	o.RetryMax = cmp.Or(o.RetryMax, defaultRetryMax)
-	if o.MaxFollowed < 1 || o.MaxPulls < 1 || o.MaxPullsPerConn < 1 || o.MaxPullsPerConn > MaxStreams-1 ||
-		o.RetryMin < 100*time.Millisecond || o.RetryMin > time.Minute || o.RetryMax < o.RetryMin || o.RetryMax > time.Hour ||
-		(o.Poll != 0 && (o.Poll < o.RetryMin || o.Poll > o.RetryMax)) {
+	if o.MaxPulls < 1 || o.MaxPullsPerConn < 1 || o.MaxPullsPerConn > MaxStreams-1 ||
+		o.RetryMin < 100*time.Millisecond || o.RetryMax < o.RetryMin ||
+		(o.Poll != 0 && o.Poll < o.RetryMin) {
 		return nil, ErrInvalidArgument
 	}
 	f := &Follower{
@@ -172,8 +170,6 @@ func (f *Follower) Add(rep *kolostore.Replica) error {
 		return ErrClosed
 	case f.logs[n] != nil:
 		return fmt.Errorf("%w: the log is already followed", ErrInvalidArgument)
-	case len(f.logs) >= f.opts.MaxFollowed:
-		return ErrFollowLimit
 	}
 	fl := &followed{name: n, rep: rep, offers: make(map[*peerLink]*offer)}
 	f.logs[n] = fl
@@ -496,7 +492,7 @@ func (f *Follower) source(fl *followed, now time.Time) (best *peerLink, wake tim
 		if fl.hint > o.hinted {
 			eff = max(eff, fl.hint)
 		}
-		if eff <= have || o.blocked || o.notFound || l.running >= f.opts.MaxPullsPerConn {
+		if (eff <= have && !o.owed) || o.blocked || o.notFound || l.running >= f.opts.MaxPullsPerConn {
 			continue
 		}
 		if now.Before(o.retryAt) {
@@ -524,8 +520,11 @@ func (f *Follower) start(fl *followed, l *peerLink) {
 	go func(before, offered, keysFrom uint64) {
 		defer l.wg.Done()
 		keys, err := f.pull(ctx, l.conn, fl.rep, keysFrom)
-		f.pulled(ctx, fl, l, before, offered, keys, err)
+		stale := f.pulled(ctx, fl, l, before, offered, keys, err)
 		cancel()
+		for _, s := range stale {
+			_ = f.checkLocal(fl, s.l, s.head)
+		}
 	}(fl.rep.Len(), o.size, fl.keysFrom)
 }
 
@@ -538,8 +537,15 @@ func (fl *followed) offer(l *peerLink) *offer {
 	return o
 }
 
+// offeredHead is a head a peer offered that was larger than the replica when it arrived.
+type offeredHead struct {
+	l    *peerLink
+	head kololog.VerifiedHead
+}
+
 // pulled records the end of a pull that began when the replica held before entries and the peer's head offered.
-func (f *Follower) pulled(ctx context.Context, fl *followed, l *peerLink, before, offered, keys uint64, err error) {
+// It returns the heads offered during the pull that the replica now holds, which the caller checks against it.
+func (f *Follower) pulled(ctx context.Context, fl *followed, l *peerLink, before, offered, keys uint64, err error) (stale []offeredHead) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	defer f.dispatch()
@@ -548,7 +554,7 @@ func (f *Follower) pulled(ctx context.Context, fl *followed, l *peerLink, before
 	f.pulls--
 	close(fl.done)
 	if f.logs[fl.name] != fl {
-		return
+		return nil
 	}
 	now := f.clk.now()
 	have := fl.rep.Len()
@@ -556,17 +562,24 @@ func (f *Follower) pulled(ctx context.Context, fl *followed, l *peerLink, before
 	if have > before {
 		fl.lastGrown = now
 		f.post(fl, FollowEvent{Kind: Grew, Peer: l.key, Len: have})
+		if !fl.diverged {
+			for p, o := range fl.offers {
+				if o.heard && o.size > before && o.size <= have && (p != l || o.size != offered) {
+					stale = append(stale, offeredHead{p, o.head})
+				}
+			}
+		}
 	}
 	o := fl.offer(l)
 	fail := func() {
-		o.fails++
+		o.fails, o.owed = o.fails+1, true
 		o.retryAt = now.Add(backoff.Delay(o.fails, f.opts.RetryMin, f.opts.RetryMax, f.rnd))
 		f.post(fl, FollowEvent{Kind: PullFailed, Peer: l.key, Len: have, Err: err})
 	}
 	switch {
 	case ctx.Err() != nil:
 	case err == nil:
-		o.fails = 0
+		o.fails, o.owed = 0, false
 		if have < offered {
 			err = fmt.Errorf("%w: the peer holds fewer entries than its head", ErrBehind)
 			fail()
@@ -585,6 +598,7 @@ func (f *Follower) pulled(ctx context.Context, fl *followed, l *peerLink, before
 	default:
 		fail()
 	}
+	return stale
 }
 
 // pullRunning reports whether err is the ErrBusy of another Pull of the replica, which is not the peer's doing.
@@ -805,7 +819,9 @@ func (f *Follower) offered(l *peerLink, fl *followed, v kololog.VerifiedHead) {
 	}
 	o := fl.offer(l)
 	o.heard, o.notFound = true, false
-	o.size = max(o.size, v.Size())
+	if v.Size() >= o.size {
+		o.size, o.head = v.Size(), v
+	}
 	if v.Size() > fl.rep.Len() {
 		f.dispatch()
 		f.mu.Unlock()

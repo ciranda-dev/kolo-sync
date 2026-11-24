@@ -1,6 +1,7 @@
 package backoff
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -56,5 +57,10 @@ func TestDegenerate(t *testing.T) {
 	}
 	if got := Delay(1<<30, time.Millisecond, time.Hour, func(k int64) int64 { return k - 1 }); got != time.Hour-1 {
 		t.Fatalf("huge n: %v", got)
+	}
+	for _, hi := range []time.Duration{math.MaxInt64, math.MaxInt64/2 + 1} {
+		if got := Delay(100, time.Second, hi, func(k int64) int64 { return k - 1 }); got < time.Second || got >= hi {
+			t.Fatalf("ceiling %v: delay %v", hi, got)
+		}
 	}
 }

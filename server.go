@@ -65,7 +65,7 @@ const (
 	// which leaves the rest of that budget to the connections themselves.
 	DefaultMaxAnswerBytes = 256 << 20
 	// DefaultMaxWatched is the default ServerOptions.MaxWatched.
-	DefaultMaxWatched = 1024
+	DefaultMaxWatched = 8192
 	// DefaultWatchGap is the default ServerOptions.WatchGap.
 	DefaultWatchGap = 100 * time.Millisecond
 )
@@ -80,7 +80,7 @@ type ServerOptions struct {
 	MaxAnswerBytes int64
 	// MaxWatched is the most distinct logs one connection may watch, at least 55; a request past it is answered too large.
 	MaxWatched int
-	// WatchGap is the least time between two pushes on a watch stream, from 10 ms to 10 s.
+	// WatchGap is the least time between two pushes on a watch stream, at least 10 ms.
 	WatchGap time.Duration
 }
 
@@ -130,7 +130,7 @@ func NewServer(authorize func(peer, owner ed25519.PublicKey, logID kololog.LogID
 }
 
 // NewServerWith is NewServer with the server-wide limits of opts; nil is all defaults.
-// A negative limit, a MaxAnswerBytes below 2 * MaxMessageSize, a MaxWatched below 55 or a WatchGap outside 10 ms to 10 s is ErrInvalidArgument.
+// A negative limit, a MaxAnswerBytes below 2 * MaxMessageSize, a MaxWatched below 55 or a WatchGap below 10 ms is ErrInvalidArgument.
 func NewServerWith(authorize func(peer, owner ed25519.PublicKey, logID kololog.LogID) Access, opts *ServerOptions) (*Server, error) {
 	var o ServerOptions
 	if opts != nil {
@@ -138,7 +138,7 @@ func NewServerWith(authorize func(peer, owner ed25519.PublicKey, logID kololog.L
 	}
 	if o.MaxTotalStreams < 0 || o.MaxAnswerBytes < 0 || (o.MaxAnswerBytes != 0 && o.MaxAnswerBytes < 2*MaxMessageSize) ||
 		(o.MaxWatched != 0 && o.MaxWatched < maxWatchItems) ||
-		(o.WatchGap != 0 && (o.WatchGap < 10*time.Millisecond || o.WatchGap > 10*time.Second)) {
+		(o.WatchGap != 0 && o.WatchGap < 10*time.Millisecond) {
 		return nil, ErrInvalidArgument
 	}
 	if o.MaxTotalStreams == 0 {

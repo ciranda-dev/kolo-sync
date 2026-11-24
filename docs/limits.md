@@ -11,8 +11,8 @@ Every fixed bound in kolo-sync, with its value and reason. A message or answer l
 | `Timeout` (opening a stream, the wait for the next request, the start of each message read or write, and each `MinProgress` bytes of a message after that) | 60s, a common server default for the time between two reads | Security: a silent peer holds a stream for at most this long. A message that keeps moving is never cut off, however slow the path: a 1 MiB answer at 2 KB/s takes about 9 minutes and arrives |
 | `MinProgress` | 16 KiB within every `Timeout`, for a message read | The slowest a message may arrive, 16 KiB a minute (about 273 bytes a second); a reader cuts off a peer that trickles less after one `Timeout` |
 | Whole message written | `Timeout` plus its size at 500 bytes a second: about 36 minutes for 1 MiB, 2.4 hours for 4 MiB | Memory: the server holds an answer until it is written, so a peer that barely reads is cut off; it can pin `MaxAnswerBytes` (256 MiB, 128 answers of 1 MiB counted twice) only by reading at least 64 KB/s in all. 500 bytes a second is the default body rate of Apache's mod_reqtimeout |
-| `ServerOptions.MaxWatched` (distinct logs one connection may watch) | 1024 (`DefaultMaxWatched`), at least 55; past it the watch stream is answered ERROR 3 | Memory and work: the heads of 1024 logs fit in one or two WATCH messages even at the largest legal head (`MaxMessageSize` / 4 KiB), and a stream's list is scanned when a log grows |
-| `ServerOptions.WatchGap` (least time between two WATCH messages on a stream, and between two probes of the watched logs) | 100 ms, 10 ms to 10 s | Work: a flood of appends costs one push per gap, and the server signs one head per log per growth |
+| `ServerOptions.MaxWatched` (distinct logs one connection may watch) | 8192 (`DefaultMaxWatched`), at least 55; past it the watch stream is answered ERROR 3 | Memory: the server keeps about 650 bytes for each log a connection names, offered or not (measured, see below), so a connection that names 8192 costs about 5 MiB, less than the 6 MiB one pull may hold. Raise it with `ServerOptions.MaxWatched` for a peer that follows more logs |
+| `ServerOptions.WatchGap` (least time between two WATCH messages on a stream, and between two probes of the watched logs) | 100 ms, at least 10 ms | CPU: one probe of every watched log per gap; measured at 4096 watched logs, a gap of 100 ms uses 2.5% of a core, 10 ms uses 19%, which is why there is no smaller gap. A push arrives within a gap and a few ms. Raise it to save CPU on a server with many watched logs |
 | Watch streams | one per connection, taking one of its `MaxStreams` slots; at most `MaxTotalStreams` over a server, counted apart from the streams that serve pulls | Memory: idle watchers must not starve pulls; no idle deadline, a dead connection ends at kolo-transport's idle timeout (30 s) |
 | WATCH_REQ items | 55 per request | A request is at most 4 KiB: (4096 - 3) / (32 + 32 + 10), the largest encoding of an item |
 | Request size | 4 KiB at most, checked with the length before the body is read | Memory: a request is a few dozen bytes, so a larger length is refused at once (`ErrTooLarge`) and no buffer is held for a body that trickles |
@@ -22,6 +22,57 @@ Every fixed bound in kolo-sync, with its value and reason. A message or answer l
 | Answers a pull holds that are not stored yet | 6 MiB of messages at most, and one message is always admitted, so a 4 MiB one is held | Memory: the reader waits for room before it reads a message, once its length is checked against `MaxMessageSize`, so `InFlight` times `MaxMessageSize` is never held and a hostile peer cannot make a pull hold more; about 5 answers of 1 MiB fit, 2 of 2 MiB or 1 of 4 MiB do |
 | Answers one commit stores | the answers that wait, until they reach 4 MiB, at least one | One sync of the store for them all instead of one each; a failed commit stores them one at a time |
 | entries one STATE answer looks at | 32768 (`MaxMessageSize` / 128, as many entries as one ENTRIES answer can hold), then it stops early | CPU: a small request costs the server at most as many entries as an ENTRIES or FETCH request; it reads only the delete markers and keys it sends, never a ciphertext |
+
+## Follower bounds
+
+A `Follower` has no limit on the number of logs it follows, connections it follows or peers it follows on: the application chooses its replicas, and no peer can add one. Only the work that peers can ask of it is bounded, and each bound is a field of `FollowOptions`.
+
+| Bound | Default | What it protects, the measured basis, how to raise it |
+|---|---|---|
+| `MaxPulls` (pulls at once over all connections) | 32 | Memory, since a pull holds up to 6 MiB of answers, so at most 192 MiB, and the peers' work. On a path with a 40 ms round trip, 256 logs of 100 KiB from 8 peers took 40.1 s with 1 pull, 9.5 s with 4, 2.5 s with 16, 1.4 s with 32 and 1.2 s with 64: the step from 16 to 32 saved 43%, from 32 to 64 17%, so 32 is the last doubling that saved more than a quarter. On loopback the time stops falling at 8 (0.68 s) as the processor is the limit. Set `FollowOptions.MaxPulls` to raise it |
+| `MaxPullsPerConn` (pulls at once on one connection) | 15, 1 to 15 | The 16 streams a peer's server keeps for a connection (`MaxStreams`), one of which the watch takes, so 15 is the most there is. One log of 64 from one peer: 8 pulls took 1.49 s and 15 took 1.54 s on the 40 ms path, 100 ms and 102 ms on loopback, so more than 8 gains nothing measurable and 15 costs nothing. Lower it with `FollowOptions.MaxPullsPerConn` for a relayed link |
+| `RetryMin`, `RetryMax` | 1 s, 10 min; `RetryMin` at least 100 ms | The peers from a retry storm: a failed pull of a log waits `RetryMin` plus a jitter that grows to `RetryMax`. 1 s is the initial retransmission interval RFC 8085 section 3.1.3 recommends for low-rate UDP applications; not measured. Both are `FollowOptions` fields with no upper bound |
+| `Poll` | 0 (never), else at least `RetryMin` | The peers' streams: a peer without WATCH is asked for the head of every followed log each `Poll`, one stream per log. Set `FollowOptions.Poll` to turn it on |
+| Events | at most 3 per followed log | Memory: only the newest event per log and kind waits; a follower of 4096 logs holds at most 12,288 |
+
+Each followed log costs the follower about 1.8 KB (measured at 256, 1024 and 4096 logs: 1.85, 1.79 and 1.71 KB) with one peer that offers it.
+
+## Measurements
+
+Taken on 2026-11-22 with `go test -run 'TestMeasurePulls|TestMeasureWatch' -v` and `KOLO_SYNC_MEASURE=1` (`limits_test.go`), without `-race`: Apple M5 (10 cores), 24 GiB, macOS 26.7.1, Go 1.27.4 darwin/arm64, 127.0.0.1 only; the 40 ms round trip is a 20 ms one-way delay from `internal/netsim`. Load average (1, 5, 15 minutes) at the start of the runs: 6.3, 5.6, 5.8 and 4.6, 4.2, 4.9; at the end: 3.5, 4.2, 5.1 and 5.2, 4.4, 4.9. Each row is the median of 3 runs of one sync of every log to a fresh follower (1 KiB entries, 100 a log); the heap column, the most heap in use above the start with the collector at 10%, is approximate.
+
+Pulls at once, 256 logs of 8 owners, one connection each:
+
+| MaxPulls | loopback | 40 ms round trip | heap above start (loopback) |
+|---|---|---|---|
+| 1 | 1601 ms | 40054 ms | 55 MiB |
+| 2 | 941 ms | 19801 ms | 55 MiB |
+| 4 | 729 ms | 9467 ms | 56 MiB |
+| 8 | 681 ms | 4650 ms | 58 MiB |
+| 16 | 675 ms | 2458 ms | 61 MiB |
+| 32 | 661 ms | 1400 ms | 71 MiB |
+| 64 | 706 ms | 1166 ms | 87 MiB |
+
+Pulls at once on one connection, 64 logs from one owner (`MaxPulls` 64):
+
+| MaxPullsPerConn | loopback | 40 ms round trip |
+|---|---|---|
+| 1 | 295 ms | 9812 ms |
+| 2 | 165 ms | 4454 ms |
+| 4 | 113 ms | 2291 ms |
+| 8 | 100 ms | 1494 ms |
+| 15 | 102 ms | 1539 ms |
+
+Watching, one connection that names n logs the server offers; the processor time is the whole program's over 3 s while nothing grows, and the push is the time from an append to its WATCH:
+
+| n | WatchGap | first heads | idle processor | push, median | heap per watched log |
+|---|---|---|---|---|---|
+| 55 | 10 ms / 100 ms / 1 s | 2 / 4 / 3 ms | 1.14% / 0.23% / 0.08% | 6 / 66 / 666 ms | |
+| 256 | 10 ms / 100 ms / 1 s | 12 / 103 / 1002 ms | 1.97% / 0.35% / 0.12% | 6 / 66 / 666 ms | 1.8 KB |
+| 1024 | 10 ms / 100 ms / 1 s | 23 / 103 / 1003 ms | 6.96% / 0.84% / 0.20% | 7 / 66 / 667 ms | 1.1 KB |
+| 4096 | 10 ms / 100 ms / 1 s | 56 / 106 / 1014 ms | 19.21% / 2.48% / 0.28% | 7 / 68 / 667 ms | 0.9 KB |
+
+A connection that names logs the server does not offer costs the server 685, 584 and 655 bytes a name at 1024, 16,384 and 65,536 names. The first heads of all n logs arrive within one `WatchGap` and a few ms.
 
 A pull of a replica therefore holds up to 6 MiB of answers, about 5 answers of 1 MiB when they arrive faster than they are
 stored; `Replica.Update` copies the answers of one commit. This bound is the same for a peer that streams and one that does not, and does
