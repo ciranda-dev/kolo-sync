@@ -24,6 +24,9 @@ replace nor withdraw another's log by reusing its ID.
   answer past either is answered busy, and the client's call returns `ErrBusy`. `MaxWatched` (default 8192),
   `MaxWatchBytes` (default 64 MiB over all connections) and `WatchGap` (default 100 ms) bound the watch stream, on which `Serve` tells a peer the heads of the logs
   it names as they grow ([protocol.md](protocol.md#watching-heads)).
+  `PeerBytesPerSecond` (default 32 MiB) and `PeerBurstBytes` (default 256 MiB) are a token bucket of the bytes of ENTRIES, FETCH and STATE answers for each peer key over all its
+  connections: an answer the bucket cannot pay for is answered busy, which ends that stream only, and the peer is served again as the bucket refills.
+  A peer that pulls a log larger than its bucket gets `ErrBusy` and keeps what it stored; a `Follower` retries it after its backoff.
   See [limits.md](limits.md).
   `authorize(peer, owner, logID) Access` gets the peer's kolo-id public
   key and the requested log's owner key and log ID, on every request of a
@@ -57,8 +60,8 @@ replace nor withdraw another's log by reusing its ID.
   read with atomics: `BytesSent`, every frame byte written, answers of
   every kind included (pulls and fetches alike), and `ActiveStreams`, the
   streams being served now, pull and fetch streams alike (refused ones not
-  counted), `RefusedByLimit`, the streams and answers refused by `MaxTotalStreams` or
-  `MaxAnswerBytes`, and `AnswerBytes`, the memory the answers in flight hold now.
+  counted), `RefusedByLimit`, the streams and answers refused by `MaxTotalStreams`,
+  `MaxAnswerBytes` or a peer's byte budget, and `AnswerBytes`, the memory the answers in flight hold now.
   There is nothing per peer or per log.
 - `Serve(ctx, conn)` answers the streams the peer opens on a
   `Conn`, for `Pull`, `PullCiphertext`, `FetchHeader`,
@@ -421,7 +424,7 @@ Errors work with `errors.Is`; none carries bytes a peer sent, only numbers such 
   `kololog.ErrInvalidHead`, ...). The replica keeps what it held.
 - `ErrProtocol`: a malformed, truncated or unexpected message, or another
   version.
-- `ErrBusy`: the peer refused the stream or an answer (`MaxStreams`, `MaxTotalStreams`, `MaxAnswerBytes`) or could not read its log, or
+- `ErrBusy`: the peer refused the stream or an answer (`MaxStreams`, `MaxTotalStreams`, `MaxAnswerBytes`, `PeerBytesPerSecond`) or could not read its log, or
   another `Pull` of the replica is running; try again later.
 - `ErrTooLarge`, `ErrTimeout`,
   `ErrInvalidArgument`.

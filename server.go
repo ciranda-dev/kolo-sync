@@ -52,6 +52,7 @@ type Server struct {
 	refused   atomic.Uint64 // streams and answers refused because a server-wide limit was reached
 	watching  atomic.Int64  // watch streams, which leave taken once their first request is read
 	wheld     atomic.Int64  // bytes reserved for the names watched, over all connections
+	budgets   *budgets
 
 	wmu   sync.Mutex // guards wlogs, wopen, wloop and the watchers of each wlog
 	wlogs map[logName]*wlog
@@ -71,6 +72,10 @@ const (
 	DefaultWatchGap = 100 * time.Millisecond
 	// DefaultMaxWatchBytes is the default ServerOptions.MaxWatchBytes, a quarter of DefaultMaxAnswerBytes.
 	DefaultMaxWatchBytes = 64 << 20
+	// DefaultPeerBytesPerSecond is the default ServerOptions.PeerBytesPerSecond.
+	DefaultPeerBytesPerSecond = 32 << 20
+	// DefaultPeerBurstBytes is the default ServerOptions.PeerBurstBytes.
+	DefaultPeerBurstBytes = 256 << 20
 )
 
 // watchNameBytes is what a connection's watched name is charged against MaxWatchBytes: about 590 bytes measured, rounded up.
@@ -78,6 +83,8 @@ const watchNameBytes = 700
 
 // ServerOptions are the limits a Server applies over all the connections it serves, on top of MaxStreams for each.
 // A zero field is its default. A stream or an answer over a limit is answered busy, which a Pull or Fetch returns as ErrBusy.
+// The bytes of ENTRIES, FETCH and STATE answers are counted for each peer key over all its connections; HEAD, proofs and
+// WATCH are not.
 type ServerOptions struct {
 	// MaxTotalStreams is the most streams served at once over all connections.
 	MaxTotalStreams int
@@ -91,6 +98,12 @@ type ServerOptions struct {
 	// MaxWatchBytes is the most memory the names watched may hold over all connections, each name of each connection
 	// counting 700 bytes; at least as many names as one WATCH_REQ holds. A request past it is answered too large.
 	MaxWatchBytes int64
+	// PeerBytesPerSecond is the rate at which each peer key earns the bytes of answers it may pull, as a token bucket.
+	// An answer the bucket cannot pay for is answered busy and the peer's other streams go on. Negative is invalid.
+	PeerBytesPerSecond int64
+	// PeerBurstBytes is the most a peer key may pull at once, the size of its bucket; at least 2 * MaxMessageSize,
+	// so one largest answer always fits. Negative is invalid.
+	PeerBurstBytes int64
 }
 
 // logName is a log's owner key and log ID.
@@ -109,7 +122,7 @@ func nameOf(owner ed25519.PublicKey, logID kololog.LogID) (logName, bool) {
 type ServerStats struct {
 	BytesSent      uint64 // frame bytes written, every answer included
 	ActiveStreams  int    // streams being served now, refused ones not included
-	RefusedByLimit uint64 // streams, answers and watched names refused because MaxTotalStreams, MaxAnswerBytes or MaxWatchBytes was reached
+	RefusedByLimit uint64 // streams, answers and watched names refused because MaxTotalStreams, MaxAnswerBytes, MaxWatchBytes or a peer's byte budget was reached
 	AnswerBytes    int64  // memory the answers being built or written hold now, counted as MaxAnswerBytes counts it
 	WatchBytes     int64  // memory the watched names hold now, counted as MaxWatchBytes counts it
 }
@@ -141,7 +154,7 @@ func NewServer(authorize func(peer, owner ed25519.PublicKey, logID kololog.LogID
 
 // NewServerWith is NewServer with the server-wide limits of opts; nil is all defaults.
 // A negative limit, a MaxAnswerBytes below 2 * MaxMessageSize, a MaxWatched below 55, a MaxWatchBytes below 55 names
-// or a WatchGap below 10 ms is ErrInvalidArgument.
+// a WatchGap below 10 ms, a negative PeerBytesPerSecond or a PeerBurstBytes below 2 * MaxMessageSize is ErrInvalidArgument.
 func NewServerWith(authorize func(peer, owner ed25519.PublicKey, logID kololog.LogID) Access, opts *ServerOptions) (*Server, error) {
 	var o ServerOptions
 	if opts != nil {
@@ -150,7 +163,8 @@ func NewServerWith(authorize func(peer, owner ed25519.PublicKey, logID kololog.L
 	if o.MaxTotalStreams < 0 || o.MaxAnswerBytes < 0 || (o.MaxAnswerBytes != 0 && o.MaxAnswerBytes < 2*MaxMessageSize) ||
 		(o.MaxWatched != 0 && o.MaxWatched < maxWatchItems) ||
 		o.MaxWatchBytes < 0 || (o.MaxWatchBytes != 0 && o.MaxWatchBytes < maxWatchItems*watchNameBytes) ||
-		(o.WatchGap != 0 && o.WatchGap < 10*time.Millisecond) {
+		(o.WatchGap != 0 && o.WatchGap < 10*time.Millisecond) ||
+		o.PeerBytesPerSecond < 0 || o.PeerBurstBytes < 0 || (o.PeerBurstBytes != 0 && o.PeerBurstBytes < 2*MaxMessageSize) {
 		return nil, ErrInvalidArgument
 	}
 	if o.MaxTotalStreams == 0 {
@@ -168,7 +182,13 @@ func NewServerWith(authorize func(peer, owner ed25519.PublicKey, logID kololog.L
 	if o.MaxWatchBytes == 0 {
 		o.MaxWatchBytes = DefaultMaxWatchBytes
 	}
-	return &Server{authorize: authorize, logs: make(map[logName]Source), wlogs: make(map[logName]*wlog), limits: o}, nil
+	if o.PeerBytesPerSecond == 0 {
+		o.PeerBytesPerSecond = DefaultPeerBytesPerSecond
+	}
+	if o.PeerBurstBytes == 0 {
+		o.PeerBurstBytes = DefaultPeerBurstBytes
+	}
+	return &Server{authorize: authorize, budgets: newBudgets(o.PeerBytesPerSecond, o.PeerBurstBytes), logs: make(map[logName]Source), wlogs: make(map[logName]*wlog), limits: o}, nil
 }
 
 // take reserves n of the counter c unless that passes limit.
@@ -205,6 +225,30 @@ func (s *Server) answer(build func() (message, uint64)) (m message, code uint64,
 			return message{}, codeBusy, 0
 		}
 		held = need
+	}
+	return m, 0, held
+}
+
+// answerTo is answer under the byte budget of peer: room for a full answer is taken before the log is read, then
+// settled to the answer's size, so a refusal reads nothing.
+func (s *Server) answerTo(peer ed25519.PublicKey, build func() (message, uint64)) (m message, code uint64, held int64) {
+	if !s.budgets.take(peer, answerBudget) {
+		s.refused.Add(1)
+		return message{}, codeBusy, 0
+	}
+	m, code, held = s.answer(build)
+	if code != 0 {
+		s.budgets.give(peer, answerBudget)
+		return m, code, 0
+	}
+	if cost := int64(bound(m)); cost < answerBudget {
+		s.budgets.give(peer, answerBudget-cost)
+	} else if cost > answerBudget && !s.budgets.take(peer, cost-answerBudget) {
+		wipe(m)
+		s.held.Add(-held)
+		s.budgets.give(peer, answerBudget)
+		s.refused.Add(1)
+		return message{}, codeBusy, 0
 	}
 	return m, 0, held
 }
@@ -414,11 +458,11 @@ func (s *Server) serveStream(ctx context.Context, peer ed25519.PublicKey, st *ko
 		case m.typ == tProofReq:
 			resp, code = proof(src, m.a, m.b)
 		case m.typ == tEntriesReq:
-			resp, code, held = s.answer(func() (message, uint64) { return entries(src, a == Keys && m.keys, m.a, m.b, 0) })
+			resp, code, held = s.answerTo(peer, func() (message, uint64) { return entries(src, a == Keys && m.keys, m.a, m.b, 0) })
 		case m.typ == tFetchReq:
-			resp, code, held = s.answer(func() (message, uint64) { return entries(src, a == Keys, m.a, m.b, m.size) })
+			resp, code, held = s.answerTo(peer, func() (message, uint64) { return entries(src, a == Keys, m.a, m.b, m.size) })
 		case m.typ == tStateReq:
-			resp, code, held = s.answer(func() (message, uint64) { return state(src, a == Keys && m.keys, m.a, m.b) })
+			resp, code, held = s.answerTo(peer, func() (message, uint64) { return state(src, a == Keys && m.keys, m.a, m.b) })
 		default:
 			code = codeProtocol
 		}
@@ -483,7 +527,7 @@ func (s *Server) pump(ctx context.Context, st *kolotransport.Stream, peer, owner
 		if src == nil {
 			return codeNotFound, true
 		}
-		resp, code, held := s.answer(func() (message, uint64) { return entries(src, a == Keys && f.keys, f.next, f.size-1, 0) })
+		resp, code, held := s.answerTo(peer, func() (message, uint64) { return entries(src, a == Keys && f.keys, f.next, f.size-1, 0) })
 		if code != 0 {
 			return code, true
 		}

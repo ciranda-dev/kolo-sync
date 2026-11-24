@@ -85,6 +85,10 @@ func TestNewServerWith(t *testing.T) {
 		{"watched below one request", &ServerOptions{MaxWatched: maxWatchItems - 1}, false},
 		{"negative gap", &ServerOptions{WatchGap: -time.Millisecond}, false},
 		{"gap below 10 ms", &ServerOptions{WatchGap: 9 * time.Millisecond}, false},
+		{"peer budget set", &ServerOptions{PeerBytesPerSecond: 1, PeerBurstBytes: 2 * MaxMessageSize}, true},
+		{"negative peer rate", &ServerOptions{PeerBytesPerSecond: -1}, false},
+		{"negative peer burst", &ServerOptions{PeerBurstBytes: -1}, false},
+		{"peer burst below one largest answer", &ServerOptions{PeerBurstBytes: 2*MaxMessageSize - 1}, false},
 		{"watch bytes set", &ServerOptions{MaxWatchBytes: maxWatchItems * watchNameBytes}, true},
 		{"negative watch bytes", &ServerOptions{MaxWatchBytes: -1}, false},
 		{"watch bytes below one request", &ServerOptions{MaxWatchBytes: maxWatchItems*watchNameBytes - 1}, false},
@@ -96,7 +100,8 @@ func TestNewServerWith(t *testing.T) {
 	}
 	s := NewServer(allowAll)
 	if s.limits.MaxTotalStreams != DefaultMaxTotalStreams || s.limits.MaxAnswerBytes != DefaultMaxAnswerBytes ||
-		s.limits.MaxWatched != DefaultMaxWatched || s.limits.WatchGap != DefaultWatchGap || s.limits.MaxWatchBytes != DefaultMaxWatchBytes {
+		s.limits.MaxWatched != DefaultMaxWatched || s.limits.WatchGap != DefaultWatchGap || s.limits.MaxWatchBytes != DefaultMaxWatchBytes ||
+		s.limits.PeerBytesPerSecond != DefaultPeerBytesPerSecond || s.limits.PeerBurstBytes != DefaultPeerBurstBytes {
 		t.Fatalf("defaults %+v", s.limits)
 	}
 }
@@ -558,4 +563,104 @@ func TestMeasureVerifyHeads(t *testing.T) {
 		}
 		t.Logf("MEASURE verify heads=%d time=%v", n, time.Since(start).Round(time.Microsecond))
 	}
+}
+
+// TestMeasurePeerBudget measures an honest pull of a log with the per-peer byte budget off (a bucket no pull can empty)
+// and at its defaults, alternating, and a catch-up larger than the burst that retries after ErrBusy every second, as a Follower does.
+func TestMeasurePeerBudget(t *testing.T) {
+	if os.Getenv("KOLO_SYNC_MEASURE") == "" {
+		t.Skip("set KOLO_SYNC_MEASURE=1 to measure")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+	serve := func(opts *ServerOptions, mib int) (*peer, *kolostore.Log, string) {
+		a, l := limited(t, opts, repeat(1<<20, mib))
+		ln, err := kolosecure.Listen(ctx, "127.0.0.1:0", a.id, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wg.Go(func() {
+			defer ln.Close()
+			for {
+				c, err := ln.Accept(ctx)
+				if err != nil {
+					return
+				}
+				wg.Go(func() { a.srv.Serve(ctx, c) })
+			}
+		})
+		return a, l, ln.Addr().String()
+	}
+	pull := func(a *peer, l *kolostore.Log, addr string, delay time.Duration, retry bool) (time.Duration, int) {
+		c := newPeer(t)
+		if delay > 0 {
+			p := netsim.Profile{Delay: delay, Seed: 1}
+			down := p
+			down.Seed = 2
+			link, err := netsim.New(addr, p, down)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer link.Close()
+			addr = link.Addr()
+		}
+		conn, err := kolosecure.Dial(ctx, addr, c.id, pub(a), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			conn.Close()
+			time.Sleep(10 * delay)
+		}()
+		r := replica(t, c, conn, a.id.PublicKey(), l.ID())
+		start, retries := time.Now(), 0
+		for {
+			err := Pull(ctx, conn, r)
+			if err == nil {
+				break
+			}
+			if !retry || !errors.Is(err, ErrBusy) {
+				t.Fatal(err)
+			}
+			retries++
+			time.Sleep(time.Second)
+		}
+		return time.Since(start), retries
+	}
+	off := &ServerOptions{PeerBytesPerSecond: 1 << 40, PeerBurstBytes: 1 << 40}
+	for _, delay := range []time.Duration{0, 20 * time.Millisecond} {
+		runs := 7
+		if delay > 0 {
+			runs = 2
+		}
+		offA, offL, offAddr := serve(off, 64)
+		defA, defL, defAddr := serve(nil, 64)
+		for run := range runs {
+			d, _ := pull(offA, offL, offAddr, delay, false)
+			t.Logf("MEASURE pull 64 MiB budget=off delay=%v run=%d elapsed=%v rate=%.0f MiB/s", delay, run, d.Round(time.Millisecond), 64/d.Seconds())
+			d, _ = pull(defA, defL, defAddr, delay, false)
+			t.Logf("MEASURE pull 64 MiB budget=default delay=%v run=%d elapsed=%v rate=%.0f MiB/s", delay, run, d.Round(time.Millisecond), 64/d.Seconds())
+		}
+	}
+	for _, mode := range []struct {
+		name string
+		opts *ServerOptions
+	}{{"off", off}, {"default", nil}} {
+		a, l, addr := serve(mode.opts, 576)
+		d, retries := pull(a, l, addr, 0, true)
+		t.Logf("MEASURE pull 576 MiB budget=%s elapsed=%v retries=%d", mode.name, d.Round(time.Millisecond), retries)
+	}
+	bs := newBudgets(DefaultPeerBytesPerSecond, DefaultPeerBurstBytes)
+	k := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	res := testing.Benchmark(func(b *testing.B) {
+		for range b.N {
+			bs.take(k, answerBudget)
+			bs.give(k, answerBudget)
+		}
+	})
+	t.Logf("MEASURE take and give: %v", res.T/time.Duration(res.N))
 }

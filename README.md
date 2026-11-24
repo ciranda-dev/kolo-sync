@@ -122,7 +122,7 @@ A log is named by its owner's public key and its log ID everywhere: in `Offer`, 
 
 | Symbol | What it does |
 |---|---|
-| `NewServer(authorize)`, `NewServerWith` | A server with no offered logs; `authorize` returns `NoAccess`, `Ciphertext` or `Keys` for each request; `NewServerWith` sets the server-wide limits on streams and answer memory (`ServerOptions`: `MaxTotalStreams`, `MaxAnswerBytes`), `MaxWatched`, `MaxWatchBytes` and `WatchGap` |
+| `NewServer(authorize)`, `NewServerWith` | A server with no offered logs; `authorize` returns `NoAccess`, `Ciphertext` or `Keys` for each request; `NewServerWith` sets the server-wide limits on streams and answer memory (`ServerOptions`: `MaxTotalStreams`, `MaxAnswerBytes`), `MaxWatched`, `MaxWatchBytes`, `WatchGap`, `PeerBytesPerSecond` and `PeerBurstBytes` |
 | `Server.Offer`, `Server.Withdraw` | Make a kolo-store or kolo-log log or replica available, or stop offering it |
 | `Conn` | The connection every call takes: `*kolosecure.Conn`, or `koloswarm.Conn` for a direct or relayed swarm link |
 | `Server.Serve(ctx, conn)` | Answer the streams a peer opens on a connection; one per connection |
@@ -138,6 +138,7 @@ A log is named by its owner's public key and its log ID everywhere: in `Offer`, 
 | `Follower.Next`, `FollowEvent`, `FollowEventKind` | The next event: `FollowGrew`, `FollowPullFailed` or `FollowDiverged` |
 | `Follower.Close` | End every `Follow` and pull; `Add`, `Follow` and `Next` then return `ErrClosed` |
 | `ServerOptions.MaxWatched`, `ServerOptions.MaxWatchBytes`, `ServerOptions.WatchGap`, `DefaultMaxWatched`, `DefaultMaxWatchBytes`, `DefaultWatchGap` | The logs one connection may watch (8192), the memory of all watched names (64 MiB) and the least time between two pushes (100 ms), see [limits](docs/limits.md) |
+| `ServerOptions.PeerBytesPerSecond`, `ServerOptions.PeerBurstBytes`, `DefaultPeerBytesPerSecond`, `DefaultPeerBurstBytes` | The bytes of answers one peer key may pull: a token bucket that refills at 32 MiB a second up to 256 MiB, see [limits](docs/limits.md) |
 | `FetchHeader`, `FetchHead` | The log's signed header, to open a replica, and the peer's signed head |
 | `Fetch` | A range of entries, each checked against a head you trust, without a replica |
 | `FetchWithKeys` | `Fetch` with entry keys you hold, to read from a peer that serves ciphertext only |
@@ -150,7 +151,7 @@ Both ends may serve and pull on one connection. `Conn` needs only `RemotePublicK
 - `authorize` runs before the offered logs are looked at, so a missing, an unoffered and an unauthorized log take one path and give the same bytes.
 - Every head, entry and proof is checked against the owner's key; a peer cannot make a live entry look deleted without the owner's signed marker.
 - Deletion is best effort: a peer that already received an entry key can keep it.
-- `Ciphertext` or `Keys` access lets a peer make the server read, prove and send up to 64 MiB of the log for one request of a few bytes, as fast as the peer reads, with no rate bound on its requests. The server holds at most `MaxStreams` streams for a connection and `MaxTotalStreams` and `MaxAnswerBytes` in all, then answers busy; grant access only to peers you trust with that load.
+- `Ciphertext` or `Keys` access lets a peer make the server read, prove and send up to 64 MiB of the log for one request of a few bytes, as fast as the peer reads, with no rate bound on its requests. The server holds at most `MaxStreams` streams for a connection and `MaxTotalStreams` and `MaxAnswerBytes` in all, then answers busy; each peer key may pull `PeerBurstBytes` and then `PeerBytesPerSecond` on average, then it is answered busy; grant access only to peers you trust with that load.
 
 ## More
 
