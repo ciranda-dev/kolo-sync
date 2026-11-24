@@ -21,8 +21,8 @@ replace nor withdraw another's log by reusing its ID.
 - `NewServer(authorize) *Server` returns a server with no offered logs;
   `NewServerWith(authorize, *ServerOptions)` also sets the limits it applies over all
   its connections, `MaxTotalStreams` (default 256) and `MaxAnswerBytes` (default 256 MiB): a stream or an
-  answer past either is answered busy, and the client's call returns `ErrBusy`. `MaxWatched` (default 8192)
-  and `WatchGap` (default 100 ms) bound the watch stream, on which `Serve` tells a peer the heads of the logs
+  answer past either is answered busy, and the client's call returns `ErrBusy`. `MaxWatched` (default 8192),
+  `MaxWatchBytes` (default 64 MiB over all connections) and `WatchGap` (default 100 ms) bound the watch stream, on which `Serve` tells a peer the heads of the logs
   it names as they grow ([protocol.md](protocol.md#watching-heads)).
   See [limits.md](limits.md).
   `authorize(peer, owner, logID) Access` gets the peer's kolo-id public
@@ -302,7 +302,7 @@ f, err := kolosync.NewFollower(nil)         // nil: the defaults below
 err = f.Add(rep)                            // each replica to keep up to date; its header names the owner
 go f.Follow(ctx, conn)                      // each connection; it returns when ctx or conn ends
 for {
-	ev, err := f.Next(ctx)                  // Grew, PullFailed or Diverged
+	ev, err := f.Next(ctx)                  // FollowGrew, FollowPullFailed or FollowDiverged
 	...
 }
 ```
@@ -324,7 +324,7 @@ for {
 - A head larger than the replica starts a pull from that peer, `PullWith` with the key cursor kept in memory for the
   log, or `PullCiphertext` if `FollowOptions.Ciphertext` is set. A pull resumes from the length the replica stores and
   from its unfinished target, and brings the delete markers. A head no larger than the replica starts nothing: it is checked
-  against the replica as `Pull` does, so another root at a size the replica holds is `ErrDiverged` and a `Diverged`
+  against the replica as `Pull` does, so another root at a size the replica holds is `ErrDiverged` and a `FollowDiverged`
   event, and an older head that matches is ignored.
 - One log is never pulled twice at once. The peer it is pulled from is, of the connected peers not in backoff for that log,
   the one that offered the largest head larger than the replica, and on a tie the one with fewer pulls running. A head that
@@ -337,7 +337,7 @@ for {
   markers and keys that come last may be missing. Another `Pull` of the replica by the application, or a failing store, waits `RetryMin` and does not count against the peer.
 - A peer that answers WATCH_REQ with ERROR 4, as a v0.1.0 server does, is pulled once for each followed log, and if
   `Poll` is set, asked for the head of each log (`FetchHead`) every `Poll`: one stream per log per period. `Poll` is 0
-  by default. ERROR 3 on the watch stream means the follower names more logs than the server's `MaxWatched`: the follower opens the stream once more with the current list, and a second ERROR 3 is treated the same way. Raise `ServerOptions.MaxWatched` on the peer to follow more.
+  by default. ERROR 3 on the watch stream means the follower names more logs than the server's `MaxWatched`, or the server holds as many watched names as its `MaxWatchBytes` allows: the follower opens the stream once more with the current list, and a second ERROR 3 is treated the same way. Pulls are not affected. Raise `ServerOptions.MaxWatched` or `MaxWatchBytes` on the peer to follow more.
 - `Hint(h)` takes a head learned elsewhere, such as from a gossip message. It is verified like a watched head; the log is then pulled
   from a connected peer that may serve it, the peers tried one at a time until one reaches it. `ErrNotFound` is a log not
   followed, `ErrInvalid` a head that does not verify.
@@ -345,8 +345,8 @@ for {
   connected peers offered a verified head of it, and `LastGrown`, when a pull last made the replica longer. It reports what
   this follower saw and proves nothing about freshness: kolo-log heads carry no time, so a peer can keep back newer heads,
   and a follower connected only to such a peer cannot tell. Follow on the owner's connection to reach the owner.
-- `Next(ctx)` returns the next event: `Grew` (a pull made the replica longer; call `Refresh` on a kolo-kv reader here),
-  `PullFailed` (with the peer and the error) or `Diverged`. Only the newest event of each kind per log waits, so the queue holds at most three
+- `Next(ctx)` returns the next event: `FollowGrew` (a pull made the replica longer; call `Refresh` on a kolo-kv reader here),
+  `FollowPullFailed` (with the peer and the error) or `FollowDiverged`. Only the newest event of each kind per log waits, so the queue holds at most three
   events per followed log; events that are not read are replaced, never block a pull.
 - `Close` ends every `Follow` and pull and waits for them; `Add`, `Follow` and `Next` then return `ErrClosed`.
 

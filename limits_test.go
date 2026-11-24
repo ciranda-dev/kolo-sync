@@ -85,6 +85,9 @@ func TestNewServerWith(t *testing.T) {
 		{"watched below one request", &ServerOptions{MaxWatched: maxWatchItems - 1}, false},
 		{"negative gap", &ServerOptions{WatchGap: -time.Millisecond}, false},
 		{"gap below 10 ms", &ServerOptions{WatchGap: 9 * time.Millisecond}, false},
+		{"watch bytes set", &ServerOptions{MaxWatchBytes: maxWatchItems * watchNameBytes}, true},
+		{"negative watch bytes", &ServerOptions{MaxWatchBytes: -1}, false},
+		{"watch bytes below one request", &ServerOptions{MaxWatchBytes: maxWatchItems*watchNameBytes - 1}, false},
 	} {
 		s, err := NewServerWith(allowAll, tc.opts)
 		if tc.ok != (err == nil) || (err != nil && !errors.Is(err, ErrInvalidArgument)) || (err == nil) != (s != nil) {
@@ -93,7 +96,7 @@ func TestNewServerWith(t *testing.T) {
 	}
 	s := NewServer(allowAll)
 	if s.limits.MaxTotalStreams != DefaultMaxTotalStreams || s.limits.MaxAnswerBytes != DefaultMaxAnswerBytes ||
-		s.limits.MaxWatched != DefaultMaxWatched || s.limits.WatchGap != DefaultWatchGap {
+		s.limits.MaxWatched != DefaultMaxWatched || s.limits.WatchGap != DefaultWatchGap || s.limits.MaxWatchBytes != DefaultMaxWatchBytes {
 		t.Fatalf("defaults %+v", s.limits)
 	}
 }
@@ -484,9 +487,9 @@ func TestMeasureWatch(t *testing.T) {
 			})
 		}
 	}
-	for _, n := range []int{1024, 16384, 65536} {
+	for _, n := range []int{1024, 16384, 65536, DefaultMaxWatchBytes / watchNameBytes} {
 		t.Run(fmt.Sprintf("unknown=%d", n), func(t *testing.T) {
-			a := watchPeer(t, ServerOptions{MaxWatched: n}, nil)
+			a := watchPeer(t, ServerOptions{MaxWatched: n, MaxWatchBytes: int64(n) * watchNameBytes, WatchGap: DefaultWatchGap}, nil)
 			c := newWatchClient(t, a)
 			before := heapInUse()
 			for i := 0; i < n; i += maxWatchItems {
@@ -499,7 +502,11 @@ func TestMeasureWatch(t *testing.T) {
 				c.send(items...)
 			}
 			time.Sleep(5 * testGap)
-			t.Logf("MEASURE named-but-not-offered=%d heap/name=%dB", n, (int64(heapInUse())-int64(before))/int64(n))
+			perName := (int64(heapInUse()) - int64(before)) / int64(n)
+			cpu, at := cpuSeconds(), time.Now()
+			time.Sleep(3 * time.Second)
+			t.Logf("MEASURE named-but-not-offered=%d heap/name=%dB idle-cpu at WatchGap %v=%.2f%%", n, perName, DefaultWatchGap,
+				(cpuSeconds()-cpu)/time.Since(at).Seconds()*100)
 		})
 	}
 	for _, n := range []int{256, 1024, 4096} {
@@ -530,5 +537,25 @@ func TestMeasureWatch(t *testing.T) {
 			time.Sleep(200 * time.Millisecond)
 			t.Logf("MEASURE followed=%d heap/log=%dB", n, (int64(heapInUse())-int64(before))/int64(n))
 		})
+	}
+}
+
+// TestMeasureVerifyHeads prints the time to check the signatures of the heads of one WATCH, at the most one holds and at the
+// most MaxMessageSize could.
+func TestMeasureVerifyHeads(t *testing.T) {
+	if os.Getenv("KOLO_SYNC_MEASURE") == "" {
+		t.Skip("set KOLO_SYNC_MEASURE=1 to measure")
+	}
+	a := newPeer(t)
+	l := ownLog(t, a, 1)
+	h := signedHead(t, l)
+	for _, n := range []int{watchBatch, MaxMessageSize / (minSigned + 2)} {
+		start := time.Now()
+		for range n {
+			if _, err := kololog.VerifyHead(h.LogKey, h.LogID, h); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Logf("MEASURE verify heads=%d time=%v", n, time.Since(start).Round(time.Microsecond))
 	}
 }

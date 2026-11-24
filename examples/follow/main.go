@@ -193,7 +193,7 @@ func grow(ctx context.Context, w io.Writer, f *kolosync.Follower, rep *kolostore
 		if err != nil {
 			return err
 		}
-		if ev.Kind == kolosync.PullFailed {
+		if ev.Kind == kolosync.FollowPullFailed {
 			return ev.Err
 		}
 	}

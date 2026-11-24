@@ -196,7 +196,7 @@ func TestFollowInitialSync(t *testing.T) {
 	follow(t, f, cb)
 	grew := map[kololog.LogID]uint64{}
 	for len(grew) < len(pairs) {
-		ev := waitEvent(t, f, Grew)
+		ev := waitEvent(t, f, FollowGrew)
 		grew[ev.LogID] = ev.Len
 	}
 	for _, p := range pairs {
@@ -360,10 +360,10 @@ func TestFollowErrorClasses(t *testing.T) {
 			}
 			follow(t, f, x.conn)
 			if tc.want == "diverged" {
-				if ev := waitEvent(t, f, Diverged); !errors.Is(ev.Err, ErrDiverged) || !bytes.Equal(ev.Peer, pub(x.a)) {
+				if ev := waitEvent(t, f, FollowDiverged); !errors.Is(ev.Err, ErrDiverged) || !bytes.Equal(ev.Peer, pub(x.a)) {
 					t.Fatalf("event %+v", ev)
 				}
-			} else if ev := waitEvent(t, f, PullFailed); ev.Err == nil || !bytes.Equal(ev.Peer, pub(x.a)) || ev.Len != 0 {
+			} else if ev := waitEvent(t, f, FollowPullFailed); ev.Err == nil || !bytes.Equal(ev.Peer, pub(x.a)) || ev.Len != 0 {
 				t.Fatalf("event %+v", ev)
 			}
 			waitFor(t, "the first pull", func() bool { return calls.Load() == 1 })
@@ -877,7 +877,7 @@ func TestWatchEqualSizeOtherRootDiverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	follow(t, f, cb)
-	ev := waitEvent(t, f, Diverged)
+	ev := waitEvent(t, f, FollowDiverged)
 	if !errors.Is(ev.Err, ErrDiverged) || !bytes.Equal(ev.Peer, pub(pb)) || ev.Len != 5 {
 		t.Fatalf("event %+v", ev)
 	}
@@ -1046,13 +1046,13 @@ func TestFollowEventsCoalesce(t *testing.T) {
 	f.mu.Lock()
 	fl := f.logs[logName{owner: [32]byte(pub(x.a)), id: x.l.ID()}]
 	for i := range 100 {
-		f.post(fl, FollowEvent{Kind: Grew, Len: uint64(i)})
-		f.post(fl, FollowEvent{Kind: PullFailed, Len: uint64(i)})
+		f.post(fl, FollowEvent{Kind: FollowGrew, Len: uint64(i)})
+		f.post(fl, FollowEvent{Kind: FollowPullFailed, Len: uint64(i)})
 	}
 	f.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	for _, kind := range []FollowEventKind{Grew, PullFailed} {
+	for _, kind := range []FollowEventKind{FollowGrew, FollowPullFailed} {
 		ev, err := f.Next(ctx)
 		if err != nil || ev.Kind != kind || ev.Len != 99 || !bytes.Equal(ev.Owner, pub(x.a)) || ev.LogID != x.l.ID() {
 			t.Fatalf("Next = %+v, %v, want the newest %d", ev, err, kind)
@@ -1092,5 +1092,13 @@ func TestFollowEndsWithConnection(t *testing.T) {
 				t.Fatalf("Follow = %v, want the error of the connection", r.err)
 			}
 		})
+	}
+}
+
+func TestFollowEventKindString(t *testing.T) {
+	for k, want := range map[FollowEventKind]string{FollowGrew: "grew", FollowPullFailed: "pull failed", FollowDiverged: "diverged", 0: "FollowEventKind(0)"} {
+		if got := k.String(); got != want {
+			t.Errorf("%d: %q, want %q", int(k), got, want)
+		}
 	}
 }

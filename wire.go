@@ -379,8 +379,9 @@ func decodeWatchReq(d *kolocodec.Decoder) ([]watchItem, error) {
 	return out, nil
 }
 
+// decodeHeads accepts at most watchBatch heads, as many as a server sends, so a follower verifies no more per message.
 func decodeHeads(d *kolocodec.Decoder) ([][]byte, error) {
-	n, err := d.UvarintMax(uint64(d.Len() / (minSigned + 2)))
+	n, err := d.UvarintMax(min(watchBatch, uint64(d.Len()/(minSigned+2))))
 	if err != nil || n == 0 {
 		return nil, err
 	}

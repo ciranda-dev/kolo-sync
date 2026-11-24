@@ -9,6 +9,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- The event kinds of a `Follower` are `FollowGrew`, `FollowPullFailed` and `FollowDiverged`, with a doc comment each and a `String`
+  method: a bare `Diverged` read like an error next to `ErrDiverged`. Not breaking: `Follower` is not in v0.1.0.
+- A WATCH of more than 256 heads, the most a server sends in one, is `ErrProtocol` for a follower, and a follower checks the
+  signature of a head once for each peer that offers it. Before, one 4 MiB WATCH could hold 32,263 heads, 1.1 s of
+  signature checks. Not breaking: WATCH is not in v0.1.0.
 - Breaking: `MinRate` is replaced by `MinProgress`. A message read is no longer cut off when its average speed is
   below 16 KiB/s: it may take as long as it needs while each 16 KiB of it arrives within `Timeout` (60 s), and a peer
   that sends less than 16 KiB in a minute is cut off after one `Timeout`. A message written may take `Timeout` plus its
@@ -24,6 +29,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   names, and then with the head of each that grows, at most once per `ServerOptions.WatchGap` (default 100 ms). A log that
   is missing, not offered or not authorized is never in a WATCH. The server probes each watched log once per gap with a read
   from memory and signs at most one head per log per growth, however often peers name it.
+- `ServerOptions.MaxWatchBytes` (default 64 MiB, `DefaultMaxWatchBytes`) and `ServerStats.WatchBytes`: the most memory the names watched may
+  hold over all connections, each name of each connection counting 700 bytes (about 590 measured), ERROR 3 past it as for
+  `MaxWatched`, which does not touch pulls. `MaxWatched` alone allowed 256 watch streams of 8192 names, about 1.3 GiB.
 - `ServerOptions.MaxWatched` (default 8192, at least 55): the most distinct logs a connection may watch, ERROR 3 past it. A
   connection that names a log costs the server about 650 bytes, offered or not. One watch stream per connection; watch
   streams are counted apart from `MaxTotalStreams`, so idle watchers do not take the slots that serve pulls. A server of
