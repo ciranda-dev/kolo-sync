@@ -36,6 +36,9 @@ func samples() []message {
 			{Record: signed('r'), Ciphertext: []byte("c0"), Marker: []byte{}, Key: key},
 			{Record: signed('s'), Ciphertext: []byte{}, Marker: signed('m'), Key: []byte{}},
 		}, proofs: [][]byte{[]byte("p0"), []byte("p1")}},
+		{typ: tWatchReq, watch: []watchItem{{owner: [keySize]byte{1}, logID: kololog.LogID{2}}, {owner: [keySize]byte{3}, logID: kololog.LogID{4}, held: 1 << 50}}},
+		{typ: tWatch},
+		{typ: tWatch, heads: [][]byte{signed('h'), signed('i')}},
 	}
 }
 
@@ -84,6 +87,70 @@ func TestFormatStream(t *testing.T) {
 	}
 }
 
+func TestFormatWatch(t *testing.T) {
+	m := message{typ: tWatchReq, watch: []watchItem{{owner: [keySize]byte{1}, logID: kololog.LogID{2}, held: 300}}}
+	want := append([]byte{69, 0, 0, 0, version, tWatchReq, 1, 1}, make([]byte, keySize-1)...)
+	want = append(append(want, 2), make([]byte, kololog.LogIDSize-1)...)
+	want = append(want, 0xac, 0x02)
+	if got := wire(m); !bytes.Equal(got, want) {
+		t.Fatalf("WATCH_REQ = %x, want %x", got, want)
+	}
+	if got, want := wire(message{typ: tWatch}), []byte{3, 0, 0, 0, version, tWatch, 0}; !bytes.Equal(got, want) {
+		t.Fatalf("WATCH = %x, want %x", got, want)
+	}
+	if !request(tWatchReq) || request(tWatch) {
+		t.Fatal("only WATCH_REQ is a request")
+	}
+	if maxWatchItems != 55 {
+		t.Fatalf("maxWatchItems = %d, want 55", maxWatchItems)
+	}
+	// The largest request, 55 items with 10-byte held lengths, fits maxSmall.
+	big := message{typ: tWatchReq, watch: make([]watchItem, maxWatchItems)}
+	for i := range big.watch {
+		big.watch[i].held = 1 << 63
+	}
+	if n := len(encode(big)); n > maxSmall {
+		t.Fatalf("a full WATCH_REQ is %d bytes, over %d", n, maxSmall)
+	}
+}
+
+func TestDecodeRejectsWatch(t *testing.T) {
+	item := make([]byte, keySize+kololog.LogIDSize+1)
+	items := func(n int) []byte { return append([]byte{version, tWatchReq, byte(n)}, bytes.Repeat(item, n)...) }
+	head := bytes.Repeat([]byte{1}, minSigned)
+	for name, b := range map[string][]byte{
+		"WATCH_REQ no items":     {version, tWatchReq, 0},
+		"WATCH_REQ 56 items":     items(maxWatchItems + 1),
+		"WATCH_REQ short":        items(2)[:len(items(2))-1],
+		"WATCH_REQ trailing":     append(items(1), 0),
+		"WATCH_REQ short owner":  {version, tWatchReq, 1, 1, 2, 3},
+		"WATCH_REQ held no byte": items(1)[:len(items(1))-1],
+		"WATCH_REQ held non-min": append(items(1)[:len(items(1))-1], 0x80, 0x00),
+		"WATCH_REQ huge count":   append([]byte{version, tWatchReq}, binary.AppendUvarint(nil, 1<<60)...),
+	} {
+		if _, err := decode(b, true); !errors.Is(err, ErrProtocol) {
+			t.Errorf("%s: %v, want ErrProtocol", name, err)
+		}
+	}
+	if _, err := decode(items(maxWatchItems), true); err != nil {
+		t.Errorf("WATCH_REQ with %d items: %v", maxWatchItems, err)
+	}
+	for name, b := range map[string][]byte{
+		"WATCH count over the bytes": append([]byte{version, tWatch, 2}, putBytes(nil, head)...),
+		"WATCH huge count":           append([]byte{version, tWatch}, binary.AppendUvarint(nil, 1<<60)...),
+		"WATCH short head":           append([]byte{version, tWatch, 1}, putBytes(nil, head[:minSigned-1])...),
+		"WATCH long head":            append([]byte{version, tWatch, 1}, putBytes(nil, make([]byte, maxSmall+1))...),
+		"WATCH trailing":             append(append([]byte{version, tWatch, 1}, putBytes(nil, head)...), 0),
+	} {
+		if _, err := decode(b, false); !errors.Is(err, ErrProtocol) {
+			t.Errorf("%s: %v, want ErrProtocol", name, err)
+		}
+	}
+	if _, err := decode(append([]byte{version, tWatch, 1}, putBytes(nil, head)...), false); err != nil {
+		t.Errorf("WATCH with one head: %v", err)
+	}
+}
+
 func TestDecodeRejects(t *testing.T) {
 	key := bytes.Repeat([]byte{7}, keySize)
 	// A FETCH with one entry whose proof is missing.
@@ -95,7 +162,7 @@ func TestDecodeRejects(t *testing.T) {
 	for name, b := range map[string][]byte{
 		"empty":              nil,
 		"version 0":          {0, tError, codeBusy},
-		"unknown type":       {version, tCreditReq + 1},
+		"unknown type":       {version, tWatch + 1},
 		"type 0":             {version, 0},
 		"error code 0":       {version, tError, 0},
 		"error code 5":       {version, tError, 5},

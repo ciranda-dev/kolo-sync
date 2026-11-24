@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	kololog "github.com/ciranda-dev/kolo-log"
 	kolotransport "github.com/ciranda-dev/kolo-transport"
@@ -49,6 +50,12 @@ type Server struct {
 	taken     atomic.Int64  // stream slots in use, over all connections
 	held      atomic.Int64  // bytes reserved for answers that are built or being written
 	refused   atomic.Uint64 // streams and answers refused because a server-wide limit was reached
+	watching  atomic.Int64  // watch streams, which leave taken once their first request is read
+
+	wmu   sync.Mutex // guards wlogs, wopen, wloop and the watchers of each wlog
+	wlogs map[logName]*wlog
+	wopen int
+	wloop *watchLoop
 }
 
 const (
@@ -57,6 +64,10 @@ const (
 	// DefaultMaxAnswerBytes is the default ServerOptions.MaxAnswerBytes, a quarter of kolo-transport's DefaultMaxMemory (1 GiB),
 	// which leaves the rest of that budget to the connections themselves.
 	DefaultMaxAnswerBytes = 256 << 20
+	// DefaultMaxWatched is the default ServerOptions.MaxWatched: heads of that many logs fit in one or two WATCH messages.
+	DefaultMaxWatched = 1024
+	// DefaultWatchGap is the default ServerOptions.WatchGap.
+	DefaultWatchGap = 100 * time.Millisecond
 )
 
 // ServerOptions are the limits a Server applies over all the connections it serves, on top of MaxStreams for each.
@@ -67,6 +78,11 @@ type ServerOptions struct {
 	// MaxAnswerBytes is the most memory the answers being built or written may hold at once; each answer counts twice its
 	// size, the entries read from the log and the frame sent. At least 2 * MaxMessageSize, so one largest answer always fits.
 	MaxAnswerBytes int64
+	// MaxWatched is the most distinct logs one connection may watch; a request past it is answered too large.
+	// At least 55, so one full WATCH_REQ fits.
+	MaxWatched int
+	// WatchGap is the least time between two pushes on a watch stream, from 10 ms to 10 s.
+	WatchGap time.Duration
 }
 
 // logName is a log's owner key and log ID.
@@ -115,13 +131,15 @@ func NewServer(authorize func(peer, owner ed25519.PublicKey, logID kololog.LogID
 }
 
 // NewServerWith is NewServer with the server-wide limits of opts; nil is all defaults.
-// A negative limit, or a MaxAnswerBytes below 2 * MaxMessageSize, is ErrInvalidArgument.
+// A negative limit, a MaxAnswerBytes below 2 * MaxMessageSize, a MaxWatched below 55 or a WatchGap outside 10 ms to 10 s is ErrInvalidArgument.
 func NewServerWith(authorize func(peer, owner ed25519.PublicKey, logID kololog.LogID) Access, opts *ServerOptions) (*Server, error) {
 	var o ServerOptions
 	if opts != nil {
 		o = *opts
 	}
-	if o.MaxTotalStreams < 0 || o.MaxAnswerBytes < 0 || (o.MaxAnswerBytes != 0 && o.MaxAnswerBytes < 2*MaxMessageSize) {
+	if o.MaxTotalStreams < 0 || o.MaxAnswerBytes < 0 || (o.MaxAnswerBytes != 0 && o.MaxAnswerBytes < 2*MaxMessageSize) ||
+		(o.MaxWatched != 0 && o.MaxWatched < maxWatchItems) ||
+		(o.WatchGap != 0 && (o.WatchGap < 10*time.Millisecond || o.WatchGap > 10*time.Second)) {
 		return nil, ErrInvalidArgument
 	}
 	if o.MaxTotalStreams == 0 {
@@ -130,7 +148,13 @@ func NewServerWith(authorize func(peer, owner ed25519.PublicKey, logID kololog.L
 	if o.MaxAnswerBytes == 0 {
 		o.MaxAnswerBytes = DefaultMaxAnswerBytes
 	}
-	return &Server{authorize: authorize, logs: make(map[logName]Source), limits: o}, nil
+	if o.MaxWatched == 0 {
+		o.MaxWatched = DefaultMaxWatched
+	}
+	if o.WatchGap == 0 {
+		o.WatchGap = DefaultWatchGap
+	}
+	return &Server{authorize: authorize, logs: make(map[logName]Source), wlogs: make(map[logName]*wlog), limits: o}, nil
 }
 
 // take reserves n of the counter c unless that passes limit.
@@ -188,6 +212,7 @@ func (s *Server) Offer(src Source) error {
 	s.mu.Lock()
 	s.logs[n] = src
 	s.mu.Unlock()
+	s.forget(n)
 	return nil
 }
 
@@ -200,10 +225,11 @@ func (s *Server) Withdraw(owner ed25519.PublicKey, logID kololog.LogID) {
 	s.mu.Lock()
 	delete(s.logs, n)
 	s.mu.Unlock()
+	s.forget(n)
 }
 
 // Serve answers the streams the peer opens on conn, for Pull, PullCiphertext, FetchHeader, FetchHead, Fetch,
-// FetchWithKeys and FetchKeys, until ctx is done or conn ends, then waits for them.
+// FetchWithKeys and FetchKeys, and a watch stream that starts with WATCH_REQ, until ctx is done or conn ends, then waits for them.
 // It must be the only caller of conn.AcceptStream.
 func (s *Server) Serve(ctx context.Context, conn Conn) error {
 	if noConn(conn) {
@@ -218,6 +244,7 @@ func (s *Server) Serve(ctx context.Context, conn Conn) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	slots := make(chan struct{}, MaxStreams)
+	var hasWatch atomic.Bool // a connection has one watch stream
 	for {
 		st, err := conn.AcceptStream(ctx)
 		if err != nil {
@@ -234,11 +261,16 @@ func (s *Server) Serve(ctx context.Context, conn Conn) error {
 				continue
 			}
 			wg.Go(func() {
+				watching := false
 				defer func() {
-					s.taken.Add(-1)
+					if watching {
+						s.watching.Add(-1)
+					} else {
+						s.taken.Add(-1)
+					}
 					<-slots
 				}()
-				s.serveStream(ctx, peer, st)
+				watching = s.serveStream(ctx, peer, st, &hasWatch)
 			})
 		default:
 			s.busy(st)
@@ -283,7 +315,8 @@ func (s *Server) lookup(peer, owner ed25519.PublicKey, logID kololog.LogID) (Sou
 	return src, a
 }
 
-func (s *Server) serveStream(ctx context.Context, peer ed25519.PublicKey, st *kolotransport.Stream) {
+// serveStream serves one stream and reports whether it became a watch stream, counted in watching instead of taken.
+func (s *Server) serveStream(ctx context.Context, peer ed25519.PublicKey, st *kolotransport.Stream, hasWatch *atomic.Bool) (watching bool) {
 	s.active.Add(1)
 	defer s.active.Add(-1)
 	stop := context.AfterFunc(ctx, func() {
@@ -302,6 +335,9 @@ func (s *Server) serveStream(ctx context.Context, peer ed25519.PublicKey, st *ko
 	if err != nil {
 		fail(readCode(err))
 		return
+	}
+	if m.typ == tWatchReq {
+		return s.serveWatch(ctx, peer, st, m, hasWatch)
 	}
 	if m.typ != tHeadReq {
 		fail(codeProtocol)
@@ -596,4 +632,333 @@ func state(src Source, keys bool, start, end uint64) (message, uint64) {
 		m.items = append(m.items, it)
 	}
 	return m, 0
+}
+
+// wlog is the head cache of a watched log, shared by every stream that watches it: a log is probed with its cached
+// size and its head is read, which signs it if the log is ours, only after it grew.
+type wlog struct {
+	mu       sync.Mutex
+	size     uint64 // size of head, 0 before a head was read
+	head     []byte // encoded head
+	watchers map[*watcher]struct{}
+}
+
+// watcher is one watch stream: the logs it names and the size of each it has been told of.
+type watcher struct {
+	names map[logName]*watched // used by the stream's goroutine only
+	wake  chan struct{}
+}
+
+// watched is a log a stream names. sent is the size the stream holds or was sent; named is set until the log is first
+// answered after being named, when a head of exactly that size is sent too.
+type watched struct {
+	wl    *wlog
+	sent  uint64
+	named bool
+}
+
+// push is a head to send to a stream and the size to record once it is sent.
+type push struct {
+	e    *watched
+	size uint64
+	head []byte
+}
+
+type watchIn struct {
+	m   message
+	err error
+}
+
+type watchLoop struct{ stop, done chan struct{} }
+
+// watchBatch is the most heads in one WATCH, so that it is far below MaxMessageSize even at the largest legal head.
+const watchBatch = answerBudget / maxSmall
+
+// serveWatch serves a watch stream whose first request is m, and reports whether the stream left taken for watching.
+// A WATCH answers each request within WatchGap, and then carries the head of a log whenever it grew, at most once a gap.
+func (s *Server) serveWatch(ctx context.Context, peer ed25519.PublicKey, st *kolotransport.Stream, m message, hasWatch *atomic.Bool) (watching bool) {
+	fail := func(code uint64) { _ = s.write(st, message{typ: tError, code: code}) }
+	if !hasWatch.CompareAndSwap(false, true) {
+		fail(codeBusy)
+		return false
+	}
+	defer hasWatch.Store(false)
+	if !s.take(&s.watching, 1, int64(s.limits.MaxTotalStreams)) {
+		fail(codeBusy)
+		return false
+	}
+	s.taken.Add(-1)
+	w := &watcher{names: make(map[logName]*watched), wake: make(chan struct{}, 1)}
+	s.watchOpen()
+	defer s.watchClose(w)
+
+	in, quit, rdone := make(chan watchIn), make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(rdone)
+		for {
+			m, err := readWatchMsg(st)
+			select {
+			case in <- watchIn{m, err}:
+			case <-quit:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(quit)
+		_ = st.CancelRead(0)
+		<-rdone
+	}()
+
+	var next time.Time // the earliest time of the next push
+	var answer, grown bool
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	var tick <-chan time.Time
+	apply := func(m message) bool {
+		if m.typ != tWatchReq {
+			fail(codeProtocol)
+			return false
+		}
+		if code := s.watchNames(w, m.watch); code != 0 {
+			fail(code)
+			return false
+		}
+		answer = true
+		return true
+	}
+	if !apply(m) {
+		return true
+	}
+	for {
+		if (answer || grown) && tick == nil {
+			if wait := time.Until(next); wait > 0 {
+				timer.Reset(wait)
+				tick = timer.C
+			} else {
+				due := answer
+				answer, grown = false, false
+				sent, alive := s.pushWatch(st, peer, w, due)
+				if !alive {
+					return true
+				}
+				if !sent {
+					answer, grown = due, true
+				}
+				next = time.Now().Add(s.limits.WatchGap)
+				continue
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return true
+		case <-w.wake:
+			grown = true
+		case <-tick:
+			tick = nil
+		case r := <-in:
+			if r.err != nil {
+				if code := readCode(r.err); code != 0 {
+					fail(code)
+				}
+				return true
+			}
+			if !apply(r.m) {
+				return true
+			}
+		}
+	}
+}
+
+// pushWatch sends the heads that stream w has not been told of, in WATCH messages, preceded by an empty one if due
+// and there are none. sent is false if an answer was refused for MaxAnswerBytes before all were sent, alive if the
+// stream can still be written to.
+func (s *Server) pushWatch(st *kolotransport.Stream, peer ed25519.PublicKey, w *watcher, due bool) (sent, alive bool) {
+	pushes := w.collect(s, peer)
+	for first := true; first || len(pushes) > 0; first = false {
+		if first && !due && len(pushes) == 0 {
+			break
+		}
+		k := min(len(pushes), watchBatch)
+		heads := make([][]byte, k)
+		for i := range heads {
+			heads[i] = pushes[i].head
+		}
+		m, code, held := s.answer(func() (message, uint64) { return message{typ: tWatch, heads: heads}, 0 })
+		if code != 0 {
+			return false, true
+		}
+		err := s.write(st, m)
+		s.held.Add(-held)
+		if err != nil {
+			return false, false
+		}
+		for _, p := range pushes[:k] {
+			p.e.sent, p.e.named = p.size, false
+		}
+		pushes = pushes[k:]
+	}
+	return true, true
+}
+
+// collect returns the heads to send to w: the head of a log that grew past what w was told of, or, for a log just
+// named, of its size or more. The logs the peer may not read are asked again only after they grow.
+func (w *watcher) collect(s *Server, peer ed25519.PublicKey) []push {
+	var out []push
+	for n, e := range w.names {
+		size, head := e.wl.snapshot()
+		if head == nil || size < e.sent || (size == e.sent && !e.named) {
+			e.named = false
+			continue
+		}
+		if src, _ := s.lookup(peer, n.owner[:], n.id); src == nil {
+			e.sent, e.named = size, false
+			continue
+		}
+		out = append(out, push{e, size, head})
+	}
+	return out
+}
+
+func (wl *wlog) snapshot() (uint64, []byte) {
+	wl.mu.Lock()
+	defer wl.mu.Unlock()
+	return wl.size, wl.head
+}
+
+// watchNames adds the logs of a WATCH_REQ to w, or replaces the length it holds of a log it names again. It returns
+// codeTooLarge if w would watch more than MaxWatched logs.
+func (s *Server) watchNames(w *watcher, items []watchItem) uint64 {
+	for _, it := range items {
+		n := logName{owner: it.owner, id: it.logID}
+		e := w.names[n]
+		if e == nil {
+			if len(w.names) >= s.limits.MaxWatched {
+				return codeTooLarge
+			}
+			s.wmu.Lock()
+			wl := s.wlogs[n]
+			if wl == nil {
+				wl = &wlog{watchers: make(map[*watcher]struct{})}
+				s.wlogs[n] = wl
+			}
+			wl.watchers[w] = struct{}{}
+			s.wmu.Unlock()
+			e = &watched{wl: wl}
+			w.names[n] = e
+		}
+		e.sent, e.named = it.held, true
+		s.refresh(n, e.wl)
+	}
+	return 0
+}
+
+// refresh reads the head of log n into wl if the log grew past it, and wakes the streams that watch it. The log is
+// probed with the record just past the cached head, which is read from memory, so a log that did not grow is never
+// signed.
+func (s *Server) refresh(n logName, wl *wlog) {
+	s.mu.RLock()
+	src := s.logs[n]
+	s.mu.RUnlock()
+	if src == nil || !wl.update(src) {
+		return
+	}
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	for w := range wl.watchers {
+		select {
+		case w.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (wl *wlog) update(src Source) bool {
+	wl.mu.Lock()
+	defer wl.mu.Unlock()
+	if _, err := src.Record(wl.size); err != nil {
+		return false
+	}
+	h, err := src.Head()
+	if err != nil || h.Size <= wl.size {
+		return false
+	}
+	wl.size, wl.head = h.Size, h.Encode()
+	return true
+}
+
+// forget drops the cached head of log n, which was offered again or withdrawn.
+func (s *Server) forget(n logName) {
+	s.wmu.Lock()
+	wl := s.wlogs[n]
+	s.wmu.Unlock()
+	if wl != nil {
+		wl.mu.Lock()
+		wl.size, wl.head = 0, nil
+		wl.mu.Unlock()
+	}
+}
+
+// watchOpen counts a watch stream and starts the loop that probes watched logs if it is the first.
+func (s *Server) watchOpen() {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	s.wopen++
+	if s.wloop == nil {
+		l := &watchLoop{stop: make(chan struct{}), done: make(chan struct{})}
+		s.wloop = l
+		go s.runWatchLoop(l)
+	}
+}
+
+// watchClose forgets w, and stops the loop if it was the last stream.
+func (s *Server) watchClose(w *watcher) {
+	s.wmu.Lock()
+	for n := range w.names {
+		wl := s.wlogs[n]
+		delete(wl.watchers, w)
+		if len(wl.watchers) == 0 {
+			delete(s.wlogs, n)
+		}
+	}
+	s.wopen--
+	var l *watchLoop
+	if s.wopen == 0 {
+		l, s.wloop = s.wloop, nil
+	}
+	s.wmu.Unlock()
+	if l != nil {
+		close(l.stop)
+		<-l.done
+	}
+}
+
+// runWatchLoop probes every watched log once per WatchGap.
+func (s *Server) runWatchLoop(l *watchLoop) {
+	defer close(l.done)
+	t := time.NewTicker(s.limits.WatchGap)
+	defer t.Stop()
+	type probe struct {
+		n  logName
+		wl *wlog
+	}
+	for {
+		select {
+		case <-l.stop:
+			return
+		case <-t.C:
+		}
+		s.wmu.Lock()
+		probes := make([]probe, 0, len(s.wlogs))
+		for n, wl := range s.wlogs {
+			probes = append(probes, probe{n, wl})
+		}
+		s.wmu.Unlock()
+		for _, p := range probes {
+			s.refresh(p.n, p.wl)
+		}
+	}
 }

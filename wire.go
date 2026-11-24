@@ -1,6 +1,7 @@
 package kolosync
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -41,6 +42,10 @@ const (
 	keySize   = 32
 	overhead  = 32                         // upper bound of a message's header fields, or of one item's
 	maxScan   = MaxMessageSize / minSigned // entries one STATE answer looks at: as many as one ENTRIES answer can hold
+
+	// maxWatchItems is the most logs in one WATCH_REQ: the request bound (maxSmall) less its version, type and count
+	// bytes, over the largest item, two keys and a 10-byte uvarint.
+	maxWatchItems = (maxSmall - 3) / (keySize + kololog.LogIDSize + binary.MaxVarintLen64)
 )
 
 const (
@@ -57,6 +62,8 @@ const (
 	tFetch
 	tStreamReq
 	tCreditReq
+	tWatchReq
+	tWatch
 )
 
 const (
@@ -82,6 +89,15 @@ type message struct {
 	items   []item          // tState
 	code    uint64          // tError
 	credit  uint64          // tStreamReq, tCreditReq: bytes of ENTRIES answers the peer may send
+	watch   []watchItem     // tWatchReq
+	heads   [][]byte        // tWatch: encoded heads
+}
+
+// watchItem is a log named in WATCH_REQ and the length the watcher holds of it.
+type watchItem struct {
+	owner [keySize]byte
+	logID kololog.LogID
+	held  uint64
 }
 
 // item is a delete marker or an entry key for one index.
@@ -129,6 +145,17 @@ func frameOf(m message) []byte {
 		b = binary.AppendUvarint(b, m.credit)
 	case tCreditReq:
 		b = binary.AppendUvarint(b, m.credit)
+	case tWatchReq:
+		b = binary.AppendUvarint(b, uint64(len(m.watch)))
+		for _, it := range m.watch {
+			b = append(append(b, it.owner[:]...), it.logID[:]...)
+			b = binary.AppendUvarint(b, it.held)
+		}
+	case tWatch:
+		b = binary.AppendUvarint(b, uint64(len(m.heads)))
+		for _, h := range m.heads {
+			b = putBytes(b, h)
+		}
 	case tHead:
 		b = putBytes(putBytes(b, m.head), m.header)
 	case tProof:
@@ -175,6 +202,10 @@ func bound(m message) int {
 	}
 	for _, it := range m.items {
 		n += overhead + blen(it.marker) + blen(it.key)
+	}
+	n += len(m.watch) * (keySize + kololog.LogIDSize + binary.MaxVarintLen64)
+	for _, h := range m.heads {
+		n += blen(h)
 	}
 	return n
 }
@@ -240,6 +271,10 @@ func decodeFields(d *kolocodec.Decoder, requests bool) (m message, err error) {
 		}
 	case tCreditReq:
 		m.credit, err = d.Uvarint()
+	case tWatchReq:
+		m.watch, err = decodeWatchReq(d)
+	case tWatch:
+		m.heads, err = decodeHeads(d)
 	case tHead:
 		if m.head, err = d.Bytes(maxSmall); err == nil {
 			m.header, err = d.Bytes(maxSmall)
@@ -319,9 +354,55 @@ func decodeEntries(d *kolocodec.Decoder, proofs bool) (out []kololog.Entry, ps [
 	return out, ps, nil
 }
 
+// decodeWatchReq decodes the one to maxWatchItems logs of WATCH_REQ.
+func decodeWatchReq(d *kolocodec.Decoder) ([]watchItem, error) {
+	n, err := d.UvarintMax(min(maxWatchItems, uint64(d.Len()/(keySize+kololog.LogIDSize+1))))
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, errors.New("no logs")
+	}
+	out := make([]watchItem, n)
+	for i := range out {
+		owner, err := d.Fixed(keySize)
+		if err != nil {
+			return nil, err
+		}
+		id, err := d.Fixed(kololog.LogIDSize)
+		if err != nil {
+			return nil, err
+		}
+		copy(out[i].owner[:], owner)
+		copy(out[i].logID[:], id)
+		if out[i].held, err = d.Uvarint(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// decodeHeads decodes the heads of WATCH, each between minSigned and maxSmall bytes.
+func decodeHeads(d *kolocodec.Decoder) ([][]byte, error) {
+	n, err := d.UvarintMax(uint64(d.Len() / (minSigned + 2)))
+	if err != nil || n == 0 {
+		return nil, err
+	}
+	out := make([][]byte, n)
+	for i := range out {
+		if out[i], err = d.Bytes(maxSmall); err != nil {
+			return nil, err
+		}
+		if len(out[i]) < minSigned {
+			return nil, errors.New("head size")
+		}
+	}
+	return out, nil
+}
+
 // request reports whether t is a request type, which only a server accepts.
 func request(t uint64) bool {
-	return t < tHead || t == tFetchReq || t == tStreamReq || t == tCreditReq
+	return t < tHead || t == tFetchReq || t == tStreamReq || t == tCreditReq || t == tWatchReq
 }
 
 func decodeItems(d *kolocodec.Decoder) (out []item, err error) {
@@ -520,6 +601,18 @@ func readAnswer(st *kolotransport.Stream, hooks frameHooks) (message, error) {
 func readMsg(st *kolotransport.Stream, requests bool) (message, error) {
 	r := &paced{st: st}
 	return readFrame(r, requests, func(int) { r.restart() })
+}
+
+// readWatchMsg reads one request on a watch stream, which is idle by design: it waits for the first byte with no
+// deadline, then reads the message as readMsg does.
+func readWatchMsg(st *kolotransport.Stream) (message, error) {
+	_ = st.SetReadDeadline(time.Time{})
+	var b [1]byte
+	if _, err := io.ReadFull(st, b[:]); err != nil {
+		return message{}, ioErr(err)
+	}
+	r := &paced{st: st}
+	return readFrame(io.MultiReader(bytes.NewReader(b[:]), r), true, func(int) { r.restart() })
 }
 
 // discardMsg reads and drops one message, with the deadlines of readMsg; it checks only the length.
